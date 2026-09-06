@@ -93,6 +93,7 @@ button{touch-action:manipulation}
 .wc-iconbtn:disabled{opacity:.45;cursor:not-allowed}
 .wc-attach{display:flex;flex-wrap:wrap;gap:6px;padding:6px 0 0}
 .wc-drop{outline:2px solid var(--wc-accent);outline-offset:-4px}
+.wc-tab-sheet{display:none}
 .wc-chip{display:inline-flex;align-items:center;gap:4px;padding:2px 10px;margin:2px 4px 2px 0;border:1px solid hsl(var(--border));border-radius:0;background:hsl(var(--background));color:hsl(var(--foreground));font-size:.76rem;font-family:ui-monospace,monospace;text-decoration:none;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .wc-img{max-width:100%;border-radius:0;margin:4px 0}
 .wc-bulk{display:inline-block;margin:6px 0;padding:4px 10px;border:1px solid color-mix(in srgb,var(--wc-accent) 45%,transparent);border-radius:0;font-size:.76rem;color:var(--wc-accent-strong);text-decoration:none;background:hsl(var(--background))}
@@ -145,7 +146,13 @@ button{touch-action:manipulation}
 .wc-clarify .q-done-row{display:flex;justify-content:flex-end;margin-top:10px}
 @media (max-width: 860px){
   .wc-root{grid-template-columns:1fr}
-  .wc-sidebar{position:absolute;z-index:20;top:0;bottom:0;left:0;width:280px;box-shadow:0 4px 24px rgb(0 0 0 / .5)}
+  .wc-sidebar{display:none}
+  .wc-tab-sheet{display:flex;position:fixed;inset:0;z-index:60}
+  .wc-tab-backdrop{position:absolute;inset:0;background:rgb(0 0 0 / .5)}
+  .wc-tab-panel{position:absolute;top:0;bottom:0;right:0;width:min(360px,100%);background:hsl(var(--card));border-left:1px solid hsl(var(--border));display:flex;flex-direction:column;box-shadow:0 4px 24px rgb(0 0 0 / .5)}
+  .wc-tab-close{font-size:16px;padding:10px 18px;border-radius:0;background:hsl(var(--card));border:1px solid hsl(var(--border));cursor:pointer;color:hsl(var(--foreground))}
+  .wc-tab-new{border-top:1px solid hsl(var(--border));padding:10px 14px;display:flex}
+  .wc-tab-new .wc-new{flex:1;font-size:16px;padding:12px}
   .wc-sidebar.hidden{display:none}
   .wc-mobile-toggle{display:inline-block}
   .wc-bubble{max-width:92%}
@@ -323,6 +330,7 @@ function ChatPage() {
   var [sessionModel, setSessionModel] = useState({});
   var [sessionEffort, setSessionEffort] = useState({});
   var [sidebarOpen, setSidebarOpen] = useState(function () { return window.innerWidth > 860; });
+  var [sessionsOpen, setSessionsOpen] = useState(false);
   var [showInfo, setShowInfo] = useState(false);
   var [clarify, setClarify] = useState(null);
   var scrollRef = useRef(null), fileRef = useRef(null), wsRef = useRef(null), inputRef = useRef(null);
@@ -359,7 +367,7 @@ function ChatPage() {
     // list, mint a fresh session so we never write into another surface's row.
     afetch(api("/sessions")).then(r => r.json()).then(d => {
       var ids = (d.sessions || []).map(s => s.session_id);
-      if (ids.length && ids.indexOf(saved) === -1) {
+      if (ids.indexOf(saved) === -1) {
         var fresh = uuid();
         setSessionId(fresh); localStorage.setItem("web-chat.session_id", fresh);
         setMessages([]); setAttachments([]);
@@ -447,7 +455,7 @@ function ChatPage() {
     ws.onclose = function () { setBusy(false); setStatus(null); wsRef.current = null; };
   }, [input, attachments, busy, messages, sessionId, profile, sessionModel, sessionEffort]);
   function key(e) { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }
-  var sessionList = sessions.length ? sessions.map(s => React.createElement("div", { key: s.session_id, className: "wc-session" + (s.session_id === sessionId ? " active" : ""), onClick: () => { loadSession(s.session_id); if (window.innerWidth <= 860) setSidebarOpen(false); } },
+  var sessionList = sessions.length ? sessions.map(s => React.createElement("div", { key: s.session_id, className: "wc-session" + (s.session_id === sessionId ? " active" : ""), onClick: () => { loadSession(s.session_id); if (window.innerWidth <= 860) { setSidebarOpen(false); setSessionsOpen(false); } } },
       React.createElement("button", { className: "wc-del", onClick: (e) => deleteSession(s.session_id, e), title: "Delete" }, "×"),
       React.createElement("div", { className: "wc-session-title" }, s.title || "New chat"),
       React.createElement("div", { className: "wc-session-prev" }, s.preview || "No messages"),
@@ -459,10 +467,19 @@ function ChatPage() {
         React.createElement("span", { className: "wc-side-title" }, "Sessions"),
         React.createElement("button", { className: "wc-new", onClick: newChat }, "+ New")),
       React.createElement("div", { className: "wc-sessions" }, sessionList),
+      sessionsOpen ? React.createElement("div", { className: "wc-tab-sheet" },
+        React.createElement("div", { className: "wc-tab-backdrop", onClick: () => setSessionsOpen(false) }),
+        React.createElement("div", { className: "wc-tab-panel" },
+          React.createElement("div", { className: "wc-side-head" },
+            React.createElement("span", { className: "wc-side-title" }, "Sessions"),
+            React.createElement("button", { className: "wc-tab-close", onClick: () => setSessionsOpen(false) }, "Done")),
+          React.createElement("div", { className: "wc-sessions" }, sessionList),
+          React.createElement("div", { className: "wc-tab-new" },
+            React.createElement("button", { className: "wc-new", onClick: () => { newChat(); setSessionsOpen(false); } }, "+ New chat")))) : null,
       React.createElement("div", { className: "wc-main" + (drag ? " wc-drop" : "") + (busy || status ? " wc-glowing" : "") },
       React.createElement("div", { className: "wc-top" },
         React.createElement("div", { className: "wc-top-left" },
-          React.createElement("button", { className: "wc-mobile-toggle", onClick: () => setSidebarOpen(o => !o), title: "Toggle sidebar" }, "☰"),
+          React.createElement("button", { className: "wc-mobile-toggle", onClick: () => { if (window.innerWidth <= 860) setSessionsOpen(true); else setSidebarOpen(o => !o); }, title: "Sessions" }, "☰"),
           React.createElement("span", { className: "wc-top-title" }, (sessions.find(s => s.session_id === sessionId) || {}).title || "Chat")),
         React.createElement("div", { className: "wc-top-right" },
           models.length ? React.createElement("select", { className: "wc-profile", value: sessionModel[sessionId] || "", onChange: e => { var v = e.target.value; setSessionPref(sessionId, { model: v }); setSessionModel(Object.assign({}, sessionModel, { [sessionId]: v })); }, title: "Model (per chat)" },
