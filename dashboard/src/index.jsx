@@ -52,6 +52,7 @@ button{touch-action:manipulation}
 .wc-session-time{font-size:.68rem;color:hsl(var(--muted-foreground) / .8);margin-top:3px}
 .wc-no-sessions{padding:16px 12px;color:hsl(var(--muted-foreground));font-size:.8rem;text-align:center;line-height:1.5}
 .wc-del{position:absolute;top:8px;right:8px;border:0;background:transparent;color:hsl(var(--muted-foreground));cursor:pointer;font-size:.9rem;opacity:0}
+@media (hover:none){.wc-del{opacity:.6}.wc-session:hover .wc-del{opacity:.6}}
 .wc-session:hover .wc-del{opacity:1}
 .wc-del:hover{color:hsl(var(--destructive))}
 .wc-main{position:relative}
@@ -66,7 +67,7 @@ button{touch-action:manipulation}
 .wc-root.sidebar-closed{grid-template-columns:1fr}
 .wc-root.sidebar-closed .wc-sidebar{display:none}
 .wc-info-pop{position:absolute;top:calc(100% + 6px);right:16px;z-index:40;background:hsl(var(--card));border:1px solid hsl(var(--border));border-radius:0;padding:8px 12px;font-size:.76rem;color:hsl(var(--foreground));box-shadow:0 4px 16px rgb(0 0 0 / .35);white-space:nowrap}
-.wc-messages{flex:1;overflow-y:auto;padding:22px 24px;scroll-behavior:smooth}
+.wc-messages{flex:1;overflow-y:auto;padding:22px 24px;scroll-behavior:smooth;overscroll-behavior:contain;-webkit-overflow-scrolling:touch}
 .wc-row{display:flex;margin-bottom:14px;animation:wc-fade-in .25s ease;min-width:0}
 .wc-row.user{justify-content:flex-end}
 .wc-row.assistant{justify-content:flex-start}
@@ -150,14 +151,21 @@ button{touch-action:manipulation}
   .wc-bubble{max-width:92%}
   .wc-messages{padding:12px 12px 18px}
   .wc-text{font-size:16px}
-  .wc-top{flex-wrap:wrap;padding:10px 12px;gap:8px}
+  .wc-top{flex-wrap:wrap;padding:10px 12px;gap:6px 8px}
   .wc-top-left{flex:1 1 100%;min-width:0}
-  .wc-top-right{flex:1 1 100%;flex-wrap:wrap;gap:6px;justify-content:flex-start;padding-top:2px}
-  .wc-profile{font-size:16px;height:38px;max-width:none;flex:1 1 calc(50% - 6px)}
-  span.wc-profile{flex:0 1 auto;max-width:150px;height:38px}
-  .wc-about{width:38px!important;height:38px!important;font-size:.85rem!important}
+  .wc-top-right{flex:0 0 auto;width:100%;flex-wrap:nowrap;gap:6px;justify-content:flex-start;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;padding-top:2px}
+  .wc-top-right::-webkit-scrollbar{display:none}
+  .wc-profile{font-size:16px;height:38px;max-width:none;flex:0 0 auto}
+  span.wc-profile{flex:0 0 auto;max-width:150px;height:38px}
+  .wc-about{width:44px!important;height:44px!important;font-size:.95rem!important}
   .wc-iconbtn{width:44px;height:44px}
-  .wc-input{padding:10px 12px;padding-bottom:calc(10px + env(safe-area-inset-bottom,0px))}
+  .wc-avatar{width:24px;height:24px;font-size:.65rem;margin-right:8px}
+  .wc-bubble{font-size:15px;line-height:1.6}
+  .wc-md{font-size:15px;line-height:1.65}
+  .wc-text{min-height:44px}
+  .wc-input{padding:10px 12px;padding-bottom:calc(10px + env(safe-area-inset-bottom,0px));gap:6px}
+  .wc-empty-sub{font-size:.85rem;max-width:320px}
+  .wc-status{padding:8px 14px}
   .wc-session{padding:12px 14px}
   .wc-new{padding:8px 14px}
   .wc-suggest-chip{padding:10px 16px}
@@ -317,7 +325,8 @@ function ChatPage() {
   var [sidebarOpen, setSidebarOpen] = useState(function () { return window.innerWidth > 860; });
   var [showInfo, setShowInfo] = useState(false);
   var [clarify, setClarify] = useState(null);
-  var scrollRef = useRef(null), fileRef = useRef(null), wsRef = useRef(null);
+  var scrollRef = useRef(null), fileRef = useRef(null), wsRef = useRef(null), inputRef = useRef(null);
+  function autosize(el) { if (!el) return; el.style.height = "auto"; el.style.height = Math.min(132, Math.max(44, el.scrollHeight)) + "px"; }
   var streamingRef = useRef("");
 
   function loadSessions() { afetch(api("/sessions")).then(r => r.json()).then(d => setSessions(d.sessions || [])).catch(() => { }); }
@@ -382,8 +391,9 @@ function ChatPage() {
     }).catch(() => { });
   }, []);
   useEffect(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, [messages, status, clarify]);
+  useEffect(() => { autosize(inputRef.current); }, [input]);
   function saveLocal(id, msgs) { afetch(api("/sessions/" + encodeURIComponent(id)), { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messages: msgs }) }).then(loadSessions).catch(() => { }); }
-  function newChat() { var id = uuid(); setSessionId(id); localStorage.setItem("web-chat.session_id", id); setMessages([]); setAttachments([]); setInput(""); setClarify(null); setError(null); }
+  function newChat() { var id = uuid(); setSessionId(id); localStorage.setItem("web-chat.session_id", id); setMessages([]); setAttachments([]); setInput(""); setClarify(null); setError(null); if (window.innerWidth <= 860) setSidebarOpen(false); }
   function deleteSession(id, e) { e.stopPropagation(); afetch(api("/sessions/" + encodeURIComponent(id)), { method: "DELETE" }).then(() => { loadSessions(); if (id === sessionId) newChat(); }); }
   function uploadFiles(files) {
     Array.from(files || []).forEach(file => {
@@ -474,7 +484,7 @@ function ChatPage() {
       React.createElement("div", { className: "wc-input" },
         React.createElement("input", { ref: fileRef, type: "file", multiple: true, style: { display: "none" }, onChange: e => uploadFiles(e.target.files) }),
         React.createElement("div", { style: { flex: 1 } },
-          React.createElement("textarea", { className: "wc-text", value: input, onChange: e => setInput(e.target.value), onKeyDown: key, placeholder: busy ? "Agent is working…" : "Type a message.", disabled: busy, rows: 1, style: { width: "100%" } }),
+          React.createElement("textarea", { ref: inputRef, className: "wc-text", value: input, onChange: e => setInput(e.target.value), onKeyDown: key, placeholder: busy ? "Agent is working…" : "Type a message.", disabled: busy, rows: 1, style: { width: "100%", overflow: "hidden" } }),
           attachments.length ? React.createElement("div", { className: "wc-attach" }, attachments.map((a, i) => React.createElement(FileChip, { key: i, path: a.path, onRemove: () => setAttachments(x => x.filter((_, j) => j !== i)) }))) : null),
         React.createElement("button", { className: "wc-iconbtn", onClick: () => fileRef.current && fileRef.current.click(), disabled: busy, title: "Attach file" }, "📎"),
         React.createElement("button", { className: "wc-iconbtn primary", onClick: () => send(), disabled: busy || (!input.trim() && !attachments.length), title: "Send" }, "➤")))));
