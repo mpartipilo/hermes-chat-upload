@@ -33,7 +33,9 @@ marked.setOptions({ gfm: true, breaks: false, renderer: (() => {
 function sanitizeMarkdownHtml(html) { return DOMPurify.sanitize(html, { ADD_ATTR: ["target", "rel"] }); }
 
 const CSS = `
-.wc-root{height:calc(100vh - 110px);display:grid;grid-template-columns:280px 1fr;gap:12px;color:hsl(var(--foreground));font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;--wc-accent:#34d399;--wc-accent-strong:#10b981;--wc-user-bg:color-mix(in srgb,var(--wc-accent) 24%,hsl(var(--card)));--wc-user-border:color-mix(in srgb,var(--wc-accent) 50%,transparent);--wc-assistant-bg:hsl(var(--card));--wc-assistant-border:color-mix(in srgb,var(--wc-accent) 22%,transparent)}
+*{-webkit-tap-highlight-color:transparent}
+button{touch-action:manipulation}
+.wc-root{height:calc(100vh - 110px);min-height:0;display:grid;grid-template-columns:280px 1fr;gap:12px;color:hsl(var(--foreground));font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;--wc-accent:#34d399;--wc-accent-strong:#10b981;--wc-user-bg:color-mix(in srgb,var(--wc-accent) 24%,hsl(var(--card)));--wc-user-border:color-mix(in srgb,var(--wc-accent) 50%,transparent);--wc-assistant-bg:hsl(var(--card));--wc-assistant-border:color-mix(in srgb,var(--wc-accent) 22%,transparent)}
 .wc-sidebar,.wc-main{background:hsl(var(--card));border:1px solid hsl(var(--border));border-radius:0;overflow:hidden;display:flex;flex-direction:column;min-height:0}
 .wc-sidebar{box-shadow:0 1px 2px rgb(0 0 0 / .2)}
 .wc-side-head{padding:12px 14px 10px;border-bottom:1px solid hsl(var(--border));display:flex;justify-content:space-between;align-items:center}
@@ -143,7 +145,19 @@ const CSS = `
   .wc-sidebar{position:absolute;z-index:20;top:0;bottom:0;left:0;width:280px;box-shadow:0 4px 24px rgb(0 0 0 / .5)}
   .wc-sidebar.hidden{display:none}
   .wc-mobile-toggle{display:inline-block}
-  .wc-bubble{max-width:88%}
+  .wc-bubble{max-width:92%}
+  .wc-messages{padding:12px 14px}
+  .wc-text{font-size:16px}
+  .wc-top{flex-wrap:wrap;padding:10px 12px;gap:8px}
+  .wc-top-right{flex-wrap:wrap}
+  .wc-profile{max-width:120px}
+  .wc-iconbtn{width:44px;height:44px}
+  .wc-input{padding:10px 12px;padding-bottom:calc(10px + env(safe-area-inset-bottom,0px))}
+  .wc-session{padding:12px 14px}
+  .wc-new{padding:8px 14px}
+  .wc-suggest-chip{padding:10px 16px}
+  .wc-clarify .q-other-row input{font-size:16px}
+  .wc-clarify button.q-choice{padding:12px 14px;font-size:14px}
 }
 `;
 function injectStyles() { if (document.getElementById("wc-v2-style")) return; var s = document.createElement("style"); s.id = "wc-v2-style"; s.textContent = CSS; document.head.appendChild(s); }
@@ -259,6 +273,26 @@ function EmptyState({ onSuggestion }) {
 
 function ChatPage() {
   useEffect(injectStyles, []);
+  // Fit the chat to the ACTUAL space below the dashboard header. The old
+  // calc(100vh - 110px) guess overflows the dashboard's own flex layout on
+  // mobile (input bar ends up below the fold). visualViewport tracks the
+  // on-screen keyboard, so the input stays visible while typing.
+  useEffect(() => {
+    function fit() {
+      var root = document.querySelector(".wc-root");
+      if (!root) return;
+      var top = root.getBoundingClientRect().top;
+      var vh = (window.visualViewport ? window.visualViewport.height : window.innerHeight) - top;
+      root.style.height = Math.max(240, Math.round(vh)) + "px";
+    }
+    fit();
+    window.addEventListener("resize", fit);
+    if (window.visualViewport) window.visualViewport.addEventListener("resize", fit);
+    return () => {
+      window.removeEventListener("resize", fit);
+      if (window.visualViewport) window.visualViewport.removeEventListener("resize", fit);
+    };
+  }, []);
   var saved = localStorage.getItem("web-chat.session_id") || uuid();
   if (!localStorage.getItem("web-chat.session_id")) localStorage.setItem("web-chat.session_id", saved);
   var [sessionId, setSessionId] = useState(saved);
@@ -311,7 +345,7 @@ function ChatPage() {
     // list, mint a fresh session so we never write into another surface's row.
     afetch(api("/sessions")).then(r => r.json()).then(d => {
       var ids = (d.sessions || []).map(s => s.session_id);
-      if (ids.length && ids.indexOf(saved) === -1) {
+      if (ids.indexOf(saved) === -1) {
         var fresh = uuid();
         setSessionId(fresh); localStorage.setItem("web-chat.session_id", fresh);
         setMessages([]); setAttachments([]);
