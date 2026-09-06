@@ -9,7 +9,7 @@ esbuild.build({
   define: { "process.env.NODE_ENV": '"production"' },
   minify: true,
   outfile: path.join(__dirname, "dist/index.js"),
-  banner: { js: "/* chat-upload plugin — v2.0.0 */" },
+  banner: { js: "/* web-chat plugin — v1.0.0 */" },
   logLevel: "info",
 }).then(() => {
   const fs = require("fs");

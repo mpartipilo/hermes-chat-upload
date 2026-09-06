@@ -1,7 +1,8 @@
-"""chat-upload dashboard plugin v2.0.0.
+"""web-chat dashboard plugin v2.1.0.
 
-Mounted by the Hermes dashboard at /api/plugins/chat-upload/.
-Local-only personal sidebar chat with disk-backed sessions and uploads.
+Mounted by the Hermes dashboard at /api/plugins/web-chat/.
+In-browser chat with real Hermes sessions (state.db), uploads, clarify
+cards, and model/effort selection.
 """
 from __future__ import annotations
 
@@ -20,6 +21,8 @@ import time
 import uuid
 import zipfile
 from collections import OrderedDict
+from concurrent.futures import Future as _ThreadFuture
+from concurrent.futures import TimeoutError as _FutureTimeout
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -35,7 +38,7 @@ except Exception:  # test fallback
 
 log = logging.getLogger(__name__)
 router = APIRouter()
-PLUGIN_VERSION = "2.0.2"
+PLUGIN_VERSION = "1.0.0"
 _MAX_FILE_BYTES = int(os.getenv("HERMES_UPLOAD_MAX_BYTES", str(100 * 1024 * 1024)))
 _MAX_BULK_FILES = 100
 _SESSION_RE = re.compile(r"^[A-Za-z0-9_.-]{1,96}$")
@@ -43,7 +46,19 @@ _LAST_CLEANUP = 0.0
 _ACTIVE_AGENT_MAX = int(os.getenv("HERMES_CHAT_UPLOAD_ACTIVE_AGENTS", "16"))
 _active_agents: "OrderedDict[str, Any]" = OrderedDict()
 _active_agent_profiles: dict[str, Optional[str]] = {}
+_active_agent_models: dict[str, str] = {}
+_active_agent_dbs: dict[str, Any] = {}
 _session_locks: dict[str, asyncio.Lock] = {}
+# WS-stream identity: the dashboard keeps one plugin WS per tab; the last writer
+# for a session owns its clarify round-trips. Keys = session_id, values = ws object.
+_ws_by_session: dict[str, WebSocket] = {}
+# In-flight clarify cards: request_id (uuid4) -> ({question, choices, multi_select, ws, answers, done})
+# The answers dict holds qid -> raw answer for the batch shape; single-question path
+# stores under the single "qanswer" key. `done` is a threading.Event set when the
+# browser answers (or the timeout fires); the agent thread waits on it.
+_pending_clarify: dict[str, dict[str, Any]] = {}
+_CLARIFY_TIMEOUT = float(os.getenv("HERMES_CHAT_CLARIFY_TIMEOUT", "300"))
+_CLARIFY_WS_LOCK = threading.Lock()
 
 _TOOL_STATUS_MAP = {
     "web_search": "searching", "web_extract": "searching",
@@ -76,11 +91,14 @@ class SessionSaveRequest(BaseModel):
     metadata: dict[str, Any] = {}
 
 
-def _root() -> Path:
-    return Path(get_hermes_home()).expanduser() / "plugins" / "chat-upload"
+class ClarifyAnswerRequest(BaseModel):
+    request_id: str
+    answer: Optional[str] = None
+    question_id: Optional[str] = None  # qid (q0..q4) for batch shape; None => single-question answer
 
-def _sessions_root() -> Path:
-    p = _root() / "sessions"; p.mkdir(parents=True, exist_ok=True); return p
+
+def _root() -> Path:
+    return Path(get_hermes_home()).expanduser() / "plugins" / "web-chat"
 
 def _uploads_root() -> Path:
     p = _root() / "uploads"; p.mkdir(parents=True, exist_ok=True); return p
@@ -141,11 +159,6 @@ def _path_allowed(path_s: str) -> Optional[Path]:
     root = _root().resolve()
     return p if _is_inside(p, root) else None
 
-def _session_file(session_id: str) -> Optional[Path]:
-    if not _valid_session_id(session_id):
-        return None
-    return _sessions_root() / f"{session_id}.json"
-
 def _derive_title(messages: list[dict[str, Any]]) -> str:
     for m in messages:
         if m.get("role") == "user":
@@ -154,59 +167,79 @@ def _derive_title(messages: list[dict[str, Any]]) -> str:
                 return text[:60]
     return "New chat"
 
-def _load_chat_session(session_id: str) -> Optional[dict[str, Any]]:
-    f = _session_file(session_id)
-    if not f or not f.exists(): return None
-    try:
-        return json.loads(f.read_text())
-    except Exception:
-        log.exception("failed to load chat-upload session %s", session_id)
-        return None
+def _open_db(profile: Optional[str] = None, read_only: bool = False) -> Any:
+    """Open the profile's real session store (state.db) — the same store the
+    dashboard, desktop, and gateway use. None/empty profile = this process's own."""
+    from hermes_cli.web_server_sessions import _open_session_db_for_profile
+    return _open_session_db_for_profile(profile, read_only=read_only)
 
-def _save_chat_session(session_id: str, profile: Optional[str] = None, history: Optional[list[dict[str, Any]]] = None, *, title: Optional[str] = None, messages: Optional[list[dict[str, Any]]] = None, metadata: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
-    if not _valid_session_id(session_id): return None
-    now = time.time()
-    existing = _load_chat_session(session_id) or {}
-    msg_list = messages if messages is not None else history if history is not None else existing.get("messages") or existing.get("history") or []
-    doc = {
-        "session_id": session_id,
-        "profile": profile if profile is not None else existing.get("profile"),
-        "title": title or existing.get("title") or _derive_title(msg_list),
-        "created_at": existing.get("created_at") or now,
-        "updated_at": now,
-        "messages": msg_list,
-        "history": msg_list,  # compatibility with v1.x tests/session files
-        "metadata": metadata if metadata is not None else existing.get("metadata", {}),
-    }
-    f = _session_file(session_id)
-    if not f: return None
-    tmp = f.with_suffix(".tmp")
-    tmp.write_text(json.dumps(doc, indent=2, ensure_ascii=False))
-    tmp.replace(f)
-    return doc
+def _session_source(session_id: str) -> Optional[str]:
+    """Resolve a session id and return its source, or None if it doesn't exist."""
+    db = _open_db(read_only=True)
+    try:
+        sid = db.resolve_session_id(session_id)
+        if not sid:
+            return None
+        s = db.get_session(sid)
+        return (s or {}).get("source")
+    finally:
+        db.close()
+
+def _load_session_messages(session_id: str) -> list[dict[str, Any]]:
+    """Read a real session's messages from state.db, mapped to the UI shape.
+
+    Only web-chat's own sessions are readable — a desktop/gateway session id
+    (e.g. a stale localStorage value from before the source filter existed)
+    must never surface here.
+    """
+    db = _open_db(read_only=True)
+    try:
+        sid = db.resolve_session_id(session_id)
+        if not sid:
+            return []
+        s = db.get_session(sid)
+        if (s or {}).get("source") != "dashboard-plugin:web-chat":
+            return []
+        rows = db.get_messages(sid, limit=500, latest=True)
+        out = []
+        for m in rows:
+            role = m.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            content = m.get("content") or m.get("text") or ""
+            if isinstance(content, list):
+                content = "\n".join(str(p.get("text", "")) for p in content if isinstance(p, dict))
+            out.append({
+                "role": role,
+                "text": str(content),
+                "content": str(content),
+                "timestamp": m.get("timestamp") or m.get("created_at") or time.time(),
+            })
+        return out
+    finally:
+        db.close()
 
 def _list_sessions() -> list[dict[str, Any]]:
-    out = []
-    for f in _sessions_root().glob("*.json"):
-        try:
-            d = json.loads(f.read_text())
-        except Exception:
-            continue
-        messages = d.get("messages") or d.get("history") or []
-        preview = ""
-        for m in reversed(messages):
-            preview = str(m.get("text") or m.get("content") or "").strip().replace("\n", " ")
-            if preview: break
-        out.append({
-            "session_id": d.get("session_id") or f.stem,
-            "title": d.get("title") or _derive_title(messages),
-            "preview": preview[:120],
-            "created_at": d.get("created_at", f.stat().st_ctime),
-            "updated_at": d.get("updated_at", f.stat().st_mtime),
-            "message_count": len(messages),
-        })
-    out.sort(key=lambda x: x.get("updated_at") or 0, reverse=True)
-    return out
+    """List ONLY this plugin's sessions (source dashboard-plugin:web-chat) from
+    state.db — never the desktop's or gateway's rows."""
+    db = _open_db(read_only=True)
+    try:
+        rows = db.list_sessions_rich(
+            limit=50, order_by_last_active=True, compact_rows=True, include_pinned=True,
+            source="dashboard-plugin:web-chat")
+        out = []
+        for s in rows:
+            out.append({
+                "session_id": s.get("id") or s.get("session_id"),
+                "title": s.get("title") or s.get("display_title") or "New chat",
+                "preview": (s.get("preview") or "")[:120],
+                "created_at": s.get("created_at"),
+                "updated_at": s.get("last_active") or s.get("updated_at"),
+                "message_count": s.get("message_count") or 0,
+            })
+        return out
+    finally:
+        db.close()
 
 def _tool_label(tool_name: str) -> str:
     if tool_name in _TOOL_STATUS_MAP: return _TOOL_STATUS_MAP[tool_name]
@@ -215,12 +248,93 @@ def _tool_label(tool_name: str) -> str:
     return "working"
 
 
+def _ws_send_safe(ws: Optional[WebSocket], payload: dict[str, Any]) -> None:
+    """Send a frame on the event loop from an agent thread."""
+    if ws is None:
+        return
+    try:
+        loop = asyncio.get_event_loop()
+        fut = asyncio.run_coroutine_threadsafe(
+            ws.send_text(json.dumps(payload, ensure_ascii=False)), loop)
+        fut.result(timeout=2)
+    except Exception:
+        log.debug("ws send failed (stream closed?)", exc_info=True)
+
+
+def _clarify_block_in_thread(
+    session_id: str,
+    question: str,
+    choices: Optional[list[str]],
+    multi_select: bool,
+    questions: Optional[list[dict[str, Any]]] = None,
+) -> str:
+    """Runs inside the agent thread (blocking). Sends a clarify card frame to the
+    browser over the session's plugin WS and blocks until the user answers
+    (POST /clarify), then returns the raw answer for clarify_tool to parse.
+    On timeout / stream loss returns the tool's "user walked away" sentinel.
+    """
+    # The clarify tool passes decorated choices (with " (Recommended)") to the
+    # callback only in the single-question path; send the display text verbatim
+    # so the card doesn't double-decorate. The batch path passes normalized
+    # entries that ALREADY carry decorated choices (+ bare choices_offered).
+    rid = uuid.uuid4().hex
+    pending: dict[str, Any] = {
+        "ws": None, "answers": {}, "done": threading.Event(), "timed_out": False,
+    }
+    if questions:
+        pending["expected_qids"] = [q.get("qid") for q in questions]
+    _pending_clarify[rid] = pending
+    with _CLARIFY_WS_LOCK:
+        ws = _ws_by_session.get(session_id)
+    pending["ws"] = ws
+    try:
+        if questions:
+            payload = {
+                "type": "clarify", "request_id": rid, "questions": questions,
+            }
+        else:
+            payload = {
+                "type": "clarify", "request_id": rid, "question": question,
+                "choices": choices, "multi_select": bool(multi_select),
+            }
+        _ws_send_safe(ws, payload)
+        if not pending["done"].wait(_CLARIFY_TIMEOUT):
+            pending["timed_out"] = True
+            try:
+                _ws_send_safe(ws, {"type": "clarify.expire", "request_id": rid})
+            except Exception:
+                pass
+            return (
+                "The user did not provide a response within the time limit. "
+                "Re-ask with a more specific question or proceed with your best judgement "
+                "and clearly note the assumption."
+            )
+        answers = pending["answers"]
+        if questions:
+            return json.dumps({"answers": answers}, ensure_ascii=False)
+        return answers.get("qanswer", "")
+    finally:
+        _pending_clarify.pop(rid, None)
+
+
 def _session_lock(session_id: str) -> asyncio.Lock:
     lock = _session_locks.get(session_id)
     if lock is None:
         lock = asyncio.Lock()
         _session_locks[session_id] = lock
     return lock
+
+
+def _register_ws(session_id: str, ws: WebSocket) -> None:
+    """Track the WS stream that owns a session's clarify round-trips."""
+    with _CLARIFY_WS_LOCK:
+        _ws_by_session[session_id] = ws
+
+
+def _unregister_ws(session_id: str, ws: WebSocket) -> None:
+    with _CLARIFY_WS_LOCK:
+        if _ws_by_session.get(session_id) is ws:
+            _ws_by_session.pop(session_id, None)
 
 
 def _agent_history_from_chat_upload(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -245,31 +359,53 @@ def _refresh_agent_callbacks(agent: Any, callbacks: dict[str, Callable | None]) 
             setattr(agent, attr, cb)
 
 
-def _get_active_agent(session_id: str, profile: Optional[str], agent_factory: Callable[..., Any], *, history: list[dict[str, Any]], callbacks: dict[str, Callable | None]) -> Any:
+def _get_active_agent(session_id: str, profile: Optional[str], agent_factory: Callable[..., Any], *, history: list[dict[str, Any]], callbacks: dict[str, Callable | None], model: str = "") -> Any:
     agent = _active_agents.get(session_id)
-    if agent is not None and _active_agent_profiles.get(session_id) != profile:
+    # Recreate when the profile OR the per-session model changed — a session's
+    # model is scoped to that chat, so switching it must take effect next turn.
+    if agent is not None and (
+        _active_agent_profiles.get(session_id) != profile
+        or (model and _active_agent_models.get(session_id) != model)
+    ):
         _active_agents.pop(session_id, None)
         _active_agent_profiles.pop(session_id, None)
+        _active_agent_models.pop(session_id, None)
+        old_db = _active_agent_dbs.pop(session_id, None)
+        if old_db is not None:
+            try: old_db.close()
+            except Exception: pass
         agent = None
     if agent is None:
+        # Give the agent the REAL session store so its chats persist to state.db
+        # with source "dashboard-plugin:web-chat" — never the desktop's rows.
+        db = _open_db(read_only=False)
         agent = agent_factory(
             session_id=session_id,
-            platform="dashboard-plugin:chat-upload",
+            platform="dashboard-plugin:web-chat",
+            session_db=db,
             tool_start_callback=callbacks.get("tool_start_callback"),
             tool_complete_callback=callbacks.get("tool_complete_callback"),
             stream_delta_callback=callbacks.get("stream_delta_callback"),
+            clarify_callback=callbacks.get("clarify_callback"),
             quiet_mode=True,
         )
+        _active_agent_dbs[session_id] = db
         if history and not getattr(agent, "_session_messages", None):
             agent._session_messages = list(history)
         _active_agents[session_id] = agent
         _active_agent_profiles[session_id] = profile
+        _active_agent_models[session_id] = model
     else:
         _active_agents.move_to_end(session_id)
         _refresh_agent_callbacks(agent, callbacks)
     while len(_active_agents) > max(1, _ACTIVE_AGENT_MAX):
         old_sid, old_agent = _active_agents.popitem(last=False)
         _active_agent_profiles.pop(old_sid, None)
+        _active_agent_models.pop(old_sid, None)
+        old_db = _active_agent_dbs.pop(old_sid, None)
+        if old_db is not None:
+            try: old_db.close()
+            except Exception: pass
         close = getattr(old_agent, "close", None)
         if callable(close):
             try:
@@ -293,8 +429,24 @@ def _check_ws_token(provided: Optional[str], ws: WebSocket | None = None) -> boo
     if ws is not None:
         host = getattr(ws.client, "host", "") if ws.client else ""
         if host in {"127.0.0.1", "::1", "localhost"}: return True
+    # Gated mode (OAuth): the SPA token is NOT injected, so the browser's WS
+    # handshake carries the OAuth session cookie instead. Verify it with the
+    # dashboard's own provider stack — same path the REST gate uses.
     try:
         from hermes_cli import web_server as _ws
+        if getattr(_ws.app.state, "auth_required", False):
+            from hermes_cli.dashboard_auth.cookies import read_session_cookies
+            from hermes_cli.dashboard_auth.request_utils import scan_session_providers
+            at, _rt = read_session_cookies(ws)
+            if at:
+                try:
+                    session = scan_session_providers(
+                        None, lambda p: p.verify_session(access_token=at),
+                        phase="plugin ws verify", log=log)
+                    return session is not None
+                except Exception:
+                    return False
+            return False
         expected = getattr(_ws, "_SESSION_TOKEN", None)
     except Exception:
         expected = None
@@ -336,7 +488,7 @@ class ChatSession:
 
 @router.get("/health")
 async def health():
-    return {"plugin": "chat-upload", "version": PLUGIN_VERSION, "ok": True}
+    return {"plugin": "web-chat", "version": PLUGIN_VERSION, "ok": True}
 
 @router.get("/profiles")
 async def profiles():
@@ -353,27 +505,33 @@ async def sessions_list():
 @router.post("/sessions")
 async def sessions_create(req: SessionSaveRequest):
     sid = _new_session_id()
-    doc = _save_chat_session(sid, messages=req.messages, title=req.title, metadata=req.metadata) or {}
-    return doc
+    return {"session_id": sid, "messages": req.messages, "title": req.title or "New chat"}
 
 @router.get("/sessions/{session_id}")
 async def sessions_get(session_id: str):
-    doc = _load_chat_session(session_id)
-    if not doc:
+    if not _valid_session_id(session_id):
+        raise HTTPException(status_code=400, detail="invalid session_id")
+    messages = _load_session_messages(session_id)
+    if not messages:
         raise HTTPException(status_code=404, detail="session not found")
-    return doc
+    return {"session_id": session_id, "messages": messages, "history": messages}
 
 @router.put("/sessions/{session_id}")
 async def sessions_put(session_id: str, req: SessionSaveRequest):
-    if not _valid_session_id(session_id): raise HTTPException(status_code=400, detail="invalid session_id")
-    doc = _save_chat_session(session_id, messages=req.messages, title=req.title, metadata=req.metadata)
-    return doc or {"ok": False}
+    # The agent persists to state.db itself; this endpoint is a no-op kept for
+    # frontend compatibility (optimistic saves).
+    return {"ok": True, "session_id": session_id}
 
 @router.delete("/sessions/{session_id}")
 async def sessions_delete(session_id: str):
     if not _valid_session_id(session_id): raise HTTPException(status_code=400, detail="invalid session_id")
-    f = _session_file(session_id)
-    if f and f.exists(): f.unlink()
+    db = _open_db(read_only=False)
+    try:
+        sid = db.resolve_session_id(session_id)
+        if sid:
+            db.delete_session(sid)
+    finally:
+        db.close()
     up = _uploads_root() / session_id
     if up.exists() and _is_inside(up, _uploads_root()): shutil.rmtree(up)
     return {"ok": True}
@@ -394,14 +552,35 @@ async def upload(file: UploadFile = File(...), session_id: str = Form(...)):
     warning = None
     if dest.suffix.lower() in _EXECUTABLE_EXTS:
         warning = "Potentially executable file uploaded; inspect before running."
-    return {"ok": True, "session_id": sid, "filename": dest.name, "original_filename": file.filename, "path": str(dest), "url": f"/api/plugins/chat-upload/file?path={dest}", "type": typ, "content_type": file.content_type, "size": len(raw), "warning": warning}
+    return {"ok": True, "session_id": sid, "filename": dest.name, "original_filename": file.filename, "path": str(dest), "url": f"/api/plugins/web-chat/file?path={dest}", "type": typ, "content_type": file.content_type, "size": len(raw), "warning": warning}
+
+@router.post("/clarify")
+async def clarify_answer(req: ClarifyAnswerRequest):
+    """Answer an in-flight clarify card (virgil-style round trip). The agent
+    thread blocked in _clarify_block_in_thread unblocks with the answer."""
+    rid = req.request_id
+    pending = _pending_clarify.get(rid)
+    if not pending:
+        raise HTTPException(status_code=404, detail="no pending clarify for this request id (expired?)")
+    if req.question_id:
+        pending["answers"][req.question_id] = req.answer or ""
+        expected = pending.get("expected_qids")
+        if expected and all(q in pending["answers"] for q in expected):
+            pending["done"].set()
+        elif not expected:
+            pending["done"].set()
+    else:
+        pending["answers"]["qanswer"] = req.answer or ""
+        pending["done"].set()
+    return {"ok": True, "request_id": rid}
+
 
 @router.get("/resolve")
 async def resolve(path: str):
     p = _path_allowed(path)
     if not p or not p.exists() or not p.is_file():
         return {"exists": False, "path": path}
-    return {"exists": True, "path": str(p), "filename": p.name, "type": _file_type(p.name), "size": p.stat().st_size, "url": f"/api/plugins/chat-upload/file?path={p}"}
+    return {"exists": True, "path": str(p), "filename": p.name, "type": _file_type(p.name), "size": p.stat().st_size, "url": f"/api/plugins/web-chat/file?path={p}"}
 
 @router.get("/file")
 async def serve_file(path: str, inline: bool = False):
@@ -423,7 +602,7 @@ async def bulk_download(req: BulkRequest):
             if p and p.exists() and p.is_file():
                 zf.write(p, arcname=p.name); count += 1
     if count == 0: raise HTTPException(status_code=404, detail="no valid files")
-    return Response(buf.getvalue(), media_type="application/zip", headers={"Content-Disposition": 'attachment; filename="chat-upload-files.zip"'})
+    return Response(buf.getvalue(), media_type="application/zip", headers={"Content-Disposition": 'attachment; filename="web-chat-files.zip"'})
 
 @router.delete("/uploads/{session_id}")
 async def clear_uploads(session_id: str):
@@ -448,8 +627,16 @@ async def stream_ws(ws: WebSocket) -> None:
         await ws.send_text(json.dumps({"type": "error", "text": "Expected {type:message, text:...}"})); await ws.close(); return
     user_text = str(msg["text"])
     session_id = _safe_session_id(msg.get("session_id"))
+    # Cross-talk guard: a session id that resolves to a NON-web-chat row (e.g. a
+    # stale localStorage value from before the source filter existed) must never
+    # be written into. Mint a fresh web-chat session and tell the browser.
+    src = _session_source(session_id)
+    if src is not None and src != "dashboard-plugin:web-chat":
+        session_id = _new_session_id()
     profile = msg.get("profile")
     attachments = msg.get("attachments") or []
+    model = msg.get("model") or ""
+    effort = msg.get("effort") or ""
     await ws.send_text(json.dumps({"type": "session", "session_id": session_id}))
     await ws.send_text(json.dumps({"type": "status", "label": "thinking"}))
     q: asyncio.Queue = asyncio.Queue(); result_holder: list[str] = []; error_holder: list[str] = []
@@ -462,13 +649,19 @@ async def stream_ws(ws: WebSocket) -> None:
         if tool_call_id and not name.startswith("_"): _push({"type": "status", "label": "thinking"})
     def _on_delta(delta: str):
         _push({"type": "status", "label": "responding"}); _push({"type": "delta", "text": delta})
+    def _on_clarify(question: str, choices=None, multi_select: bool = False, questions=None) -> str:
+        # Runs on the agent thread; blocks until the browser answers the card
+        # or the timeout fires. `questions` (batch shape) wins when non-empty.
+        return _clarify_block_in_thread(
+            session_id, question, choices, multi_select, questions=questions)
+
+    _register_ws(session_id, ws)
 
     async with _session_lock(session_id):
-        prior = _load_chat_session(session_id) or {"messages": []}
-        history = list(prior.get("messages") or prior.get("history") or [])
+        # History comes from the REAL store (state.db) — the same sessions the
+        # dashboard/desktop/gateway see. The agent persists to it itself.
+        history = _load_session_messages(session_id)
         agent_history = _agent_history_from_chat_upload(history)
-        history.append({"role": "user", "text": user_text, "content": user_text, "timestamp": time.time(), "attachments": attachments})
-        _save_chat_session(session_id, profile=profile, messages=history)
 
         def _run_agent():
             try:
@@ -476,24 +669,41 @@ async def stream_ws(ws: WebSocket) -> None:
                 if ha_path not in sys.path: sys.path.insert(0, ha_path)
                 from run_agent import AIAgent
                 from hermes_cli.config import cfg_get, load_config
-                cfg = load_config(); model = cfg_get(cfg, "model", "default", default=""); provider = cfg_get(cfg, "model", "provider", default=None)
+                cfg = load_config()
+                default_model = cfg_get(cfg, "model", "default", default="")
+                default_provider = cfg_get(cfg, "model", "provider", default=None)
+                use_model = model or default_model
+                use_provider = default_provider
+                # Effort: explicit per-turn override wins; else the config's
+                # resolved reasoning config (per-model override > global).
+                reasoning_config = None
+                if effort:
+                    from hermes_constants import parse_reasoning_effort
+                    reasoning_config = parse_reasoning_effort(effort)
+                else:
+                    from hermes_constants import resolve_reasoning_config
+                    reasoning_config = resolve_reasoning_config(cfg, use_model)
                 def _agent_factory(**kwargs):
-                    return AIAgent(model=model, provider=provider, **kwargs)
+                    return AIAgent(
+                        model=use_model, provider=use_provider,
+                        reasoning_config=reasoning_config, **kwargs)
                 agent = _get_active_agent(
                     session_id,
                     profile,
                     _agent_factory,
                     history=agent_history,
+                    model=use_model,
                     callbacks={
                         "tool_start_callback": _on_tool_start,
                         "tool_complete_callback": _on_tool_complete,
                         "stream_delta_callback": _on_delta,
+                        "clarify_callback": _on_clarify,
                     },
                 )
                 response = _run_agent_turn(agent, user_text)
                 result_holder.append(response or "")
             except Exception as exc:
-                log.exception("chat-upload agent error"); error_holder.append(str(exc))
+                log.exception("web-chat agent error"); error_holder.append(str(exc))
         thread = threading.Thread(target=_run_agent, daemon=True); thread.start()
         full_parts: list[str] = []
         try:
@@ -509,8 +719,9 @@ async def stream_ws(ws: WebSocket) -> None:
             await ws.send_text(json.dumps({"type": "error", "text": error_holder[0]}))
         else:
             full = result_holder[0] if result_holder else "".join(full_parts)
-            history.append({"role": "assistant", "text": full, "content": full, "timestamp": time.time(), "attachments": []})
-            doc = _save_chat_session(session_id, profile=profile, messages=history, title=prior.get("title")) or {}
-            await ws.send_text(json.dumps({"type": "done", "text": full, "session_id": session_id, "session": {"title": doc.get("title"), "updated_at": doc.get("updated_at")}}))
+            # The agent persisted the turn to state.db itself; just echo the
+            # final text so the UI can finalize the streaming bubble.
+            await ws.send_text(json.dumps({"type": "done", "text": full, "session_id": session_id}))
             await ws.send_text(json.dumps({"type": "clear"}))
+    _unregister_ws(session_id, ws)
     await ws.close()

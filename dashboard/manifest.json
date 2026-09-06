@@ -1,10 +1,10 @@
 {
-  "name": "chat-upload",
-  "label": "Chat",
-  "description": "In-browser chat with Markdown, uploads, persistent sessions, and live tool status",
+  "name": "web-chat",
+  "label": "Web Chat",
+  "description": "In-browser chat with Markdown, uploads, persistent sessions, live tool status, clarify cards, and model/effort selection",
   "icon": "MessageCircle",
-  "version": "2.0.4",
-  "tab": { "path": "/chat-upload", "position": "after:sessions" },
+  "version": "1.0.0",
+  "tab": { "path": "/web-chat", "position": "after:sessions" },
   "slots": [],
   "entry": "dist/index.js",
   "api": "plugin_api.py"
