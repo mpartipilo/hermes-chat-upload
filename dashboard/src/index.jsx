@@ -48,6 +48,8 @@ button{touch-action:manipulation}
 .wc-session:hover{background:hsl(var(--muted))}
 .wc-session.active{background:color-mix(in srgb,var(--wc-accent) 10%,transparent);border-left-color:var(--wc-accent);border-color:color-mix(in srgb,var(--wc-accent) 30%,transparent)}
 .wc-session-title{font-weight:600;font-size:.85rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-right:18px}
+.wc-session-title-row{display:flex;align-items:center;gap:6px;min-width:0}
+.wc-src-badge{flex-shrink:0;font-size:.62rem;font-weight:600;text-transform:uppercase;letter-spacing:.03em;color:hsl(var(--muted-foreground));border:1px solid hsl(var(--border));border-radius:0;padding:1px 5px;background:hsl(var(--background))}
 .wc-session-prev{font-size:.74rem;color:hsl(var(--muted-foreground));white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}
 .wc-session-time{font-size:.68rem;color:hsl(var(--muted-foreground) / .8);margin-top:3px}
 .wc-no-sessions{padding:16px 12px;color:hsl(var(--muted-foreground));font-size:.8rem;text-align:center;line-height:1.5}
@@ -184,6 +186,11 @@ function injectStyles() { if (document.getElementById("wc-v2-style")) return; va
 function api(path) { return (window.__HERMES_BASE_PATH__ || "") + "/api/plugins/web-chat" + path; }
 function wsUrl(path) { var proto = location.protocol === "https:" ? "wss:" : "ws:"; var token = window.__HERMES_SESSION_TOKEN__ || ""; return proto + "//" + location.host + api(path) + "?token=" + encodeURIComponent(token); }
 function fmtTime(ts) { if (!ts) return ""; try { return new Date(ts * 1000).toLocaleString(); } catch (e) { return ""; } }
+function sourceLabel(src) {
+  if (!src || src === "dashboard-plugin:web-chat") return "";
+  if (src === "api_server") return "api";
+  return String(src).replace(/^dashboard-plugin:/, "").slice(0, 10);
+}
 function uuid() { return (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random()).replace(/[^A-Za-z0-9_.-]/g, "-"); }
 function stripRec(s) { return String(s || "").replace(/\s*\(Recommended\)\s*$/i, ""); }
 function isRec(s) { return /\(Recommended\)\s*$/i.test(String(s || "")); }
@@ -457,7 +464,9 @@ function ChatPage() {
   function key(e) { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }
   var sessionList = sessions.length ? sessions.map(s => React.createElement("div", { key: s.session_id, className: "wc-session" + (s.session_id === sessionId ? " active" : ""), onClick: () => { loadSession(s.session_id); if (window.innerWidth <= 860) { setSidebarOpen(false); setSessionsOpen(false); } } },
       React.createElement("button", { className: "wc-del", onClick: (e) => deleteSession(s.session_id, e), title: "Delete" }, "×"),
-      React.createElement("div", { className: "wc-session-title" }, s.title || "New chat"),
+      React.createElement("div", { className: "wc-session-title-row" },
+        React.createElement("span", { className: "wc-session-title" }, s.title || "New chat"),
+        sourceLabel(s.source) ? React.createElement("span", { className: "wc-src-badge" }, sourceLabel(s.source)) : null),
       React.createElement("div", { className: "wc-session-prev" }, s.preview || "No messages"),
       React.createElement("div", { className: "wc-session-time" }, fmtTime(s.updated_at))))
       : React.createElement("div", { className: "wc-no-sessions" }, "No sessions yet - send a message to start.");

@@ -198,7 +198,7 @@ def _load_session_messages(session_id: str) -> list[dict[str, Any]]:
         if not sid:
             return []
         s = db.get_session(sid)
-        if (s or {}).get("source") != "dashboard-plugin:web-chat":
+        if not s:
             return []
         rows = db.get_messages(sid, limit=500, latest=True)
         out = []
@@ -226,7 +226,7 @@ def _list_sessions() -> list[dict[str, Any]]:
     try:
         rows = db.list_sessions_rich(
             limit=50, order_by_last_active=True, compact_rows=True, include_pinned=True,
-            source="dashboard-plugin:web-chat")
+            exclude_sources=["cron"])
         out = []
         for s in rows:
             out.append({
@@ -236,6 +236,7 @@ def _list_sessions() -> list[dict[str, Any]]:
                 "created_at": s.get("created_at"),
                 "updated_at": s.get("last_active") or s.get("updated_at"),
                 "message_count": s.get("message_count") or 0,
+                "source": s.get("source") or "",
             })
         return out
     finally:
@@ -631,7 +632,7 @@ async def stream_ws(ws: WebSocket) -> None:
     # stale localStorage value from before the source filter existed) must never
     # be written into. Mint a fresh web-chat session and tell the browser.
     src = _session_source(session_id)
-    if src is not None and src != "dashboard-plugin:web-chat":
+    if src is None:
         session_id = _new_session_id()
     profile = msg.get("profile")
     attachments = msg.get("attachments") or []
