@@ -314,7 +314,7 @@ function ChatPage() {
   // Per-session model/effort: each chat remembers its own selection.
   var [sessionModel, setSessionModel] = useState({});
   var [sessionEffort, setSessionEffort] = useState({});
-  var [sidebarOpen, setSidebarOpen] = useState(true);
+  var [sidebarOpen, setSidebarOpen] = useState(function () { return window.innerWidth > 860; });
   var [showInfo, setShowInfo] = useState(false);
   var [clarify, setClarify] = useState(null);
   var scrollRef = useRef(null), fileRef = useRef(null), wsRef = useRef(null);
@@ -350,7 +350,7 @@ function ChatPage() {
     // list, mint a fresh session so we never write into another surface's row.
     afetch(api("/sessions")).then(r => r.json()).then(d => {
       var ids = (d.sessions || []).map(s => s.session_id);
-      if (ids.indexOf(saved) === -1) {
+      if (ids.length && ids.indexOf(saved) === -1) {
         var fresh = uuid();
         setSessionId(fresh); localStorage.setItem("web-chat.session_id", fresh);
         setMessages([]); setAttachments([]);
