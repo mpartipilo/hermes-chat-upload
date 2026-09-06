@@ -50,6 +50,7 @@ button{touch-action:manipulation}
 .wc-session-title{font-weight:600;font-size:.85rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-right:18px}
 .wc-session-prev{font-size:.74rem;color:hsl(var(--muted-foreground));white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}
 .wc-session-time{font-size:.68rem;color:hsl(var(--muted-foreground) / .8);margin-top:3px}
+.wc-no-sessions{padding:16px 12px;color:hsl(var(--muted-foreground));font-size:.8rem;text-align:center;line-height:1.5}
 .wc-del{position:absolute;top:8px;right:8px;border:0;background:transparent;color:hsl(var(--muted-foreground));cursor:pointer;font-size:.9rem;opacity:0}
 .wc-session:hover .wc-del{opacity:1}
 .wc-del:hover{color:hsl(var(--destructive))}
@@ -58,7 +59,7 @@ button{touch-action:manipulation}
 @keyframes wc-glow-pulse{0%,100%{box-shadow:0 0 0 1.5px color-mix(in srgb,var(--wc-accent) 30%,transparent),0 0 18px 2px color-mix(in srgb,var(--wc-accent) 12%,transparent)}50%{box-shadow:0 0 0 1.5px color-mix(in srgb,var(--wc-accent) 55%,transparent),0 0 28px 4px color-mix(in srgb,var(--wc-accent) 20%,transparent)}}
 .wc-top{position:relative;padding:12px 16px;border-bottom:1px solid hsl(var(--border));display:flex;justify-content:space-between;align-items:center;gap:10px}
 .wc-top-left{display:flex;align-items:center;gap:10px;min-width:0}
-.wc-top-title{font-weight:700;font-size:.95rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.wc-top-title{font-weight:700;font-size:.95rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
 .wc-top-right{display:flex;align-items:center;gap:8px}
 .wc-profile{font-size:.76rem;padding:4px 8px;border-radius:0;background:hsl(var(--card));color:var(--wc-accent-strong);border:1px solid color-mix(in srgb,var(--wc-accent) 40%,transparent);cursor:pointer;max-width:170px;height:26px}
 .wc-mobile-toggle{display:inline-flex;align-items:center;font-size:.8rem;padding:4px 10px;border-radius:0;background:hsl(var(--muted));border:1px solid hsl(var(--border));cursor:pointer;color:hsl(var(--foreground))}
@@ -66,7 +67,7 @@ button{touch-action:manipulation}
 .wc-root.sidebar-closed .wc-sidebar{display:none}
 .wc-info-pop{position:absolute;top:calc(100% + 6px);right:16px;z-index:40;background:hsl(var(--card));border:1px solid hsl(var(--border));border-radius:0;padding:8px 12px;font-size:.76rem;color:hsl(var(--foreground));box-shadow:0 4px 16px rgb(0 0 0 / .35);white-space:nowrap}
 .wc-messages{flex:1;overflow-y:auto;padding:22px 24px;scroll-behavior:smooth}
-.wc-row{display:flex;margin-bottom:14px;animation:wc-fade-in .25s ease}
+.wc-row{display:flex;margin-bottom:14px;animation:wc-fade-in .25s ease;min-width:0}
 .wc-row.user{justify-content:flex-end}
 .wc-row.assistant{justify-content:flex-start}
 .wc-avatar{width:28px;height:28px;border-radius:0;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:.75rem;font-weight:700;margin-right:10px;background:hsl(var(--muted));border:1px solid hsl(var(--border));color:hsl(var(--muted-foreground))}
@@ -87,6 +88,7 @@ button{touch-action:manipulation}
 .wc-iconbtn:hover:not(:disabled){border-color:var(--wc-accent);color:var(--wc-accent-strong)}
 .wc-iconbtn.primary{background:var(--wc-accent-strong);border-color:var(--wc-accent-strong);color:#04241a}
 .wc-iconbtn.primary:hover:not(:disabled){filter:brightness(1.15)}
+.wc-about{width:28px;height:28px;font-size:.8rem}
 .wc-iconbtn:disabled{opacity:.45;cursor:not-allowed}
 .wc-attach{display:flex;flex-wrap:wrap;gap:6px;padding:6px 0 0}
 .wc-drop{outline:2px solid var(--wc-accent);outline-offset:-4px}
@@ -146,11 +148,14 @@ button{touch-action:manipulation}
   .wc-sidebar.hidden{display:none}
   .wc-mobile-toggle{display:inline-block}
   .wc-bubble{max-width:92%}
-  .wc-messages{padding:12px 14px}
+  .wc-messages{padding:12px 12px 18px}
   .wc-text{font-size:16px}
   .wc-top{flex-wrap:wrap;padding:10px 12px;gap:8px}
-  .wc-top-right{flex-wrap:wrap}
-  .wc-profile{max-width:120px}
+  .wc-top-left{flex:1 1 100%;min-width:0}
+  .wc-top-right{flex:1 1 100%;flex-wrap:wrap;gap:6px;justify-content:flex-start;padding-top:2px}
+  .wc-profile{font-size:16px;height:38px;max-width:none;flex:1 1 calc(50% - 6px)}
+  span.wc-profile{flex:0 1 auto;max-width:150px;height:38px}
+  .wc-about{width:38px!important;height:38px!important;font-size:.85rem!important}
   .wc-iconbtn{width:44px;height:44px}
   .wc-input{padding:10px 12px;padding-bottom:calc(10px + env(safe-area-inset-bottom,0px))}
   .wc-session{padding:12px 14px}
@@ -432,17 +437,18 @@ function ChatPage() {
     ws.onclose = function () { setBusy(false); setStatus(null); wsRef.current = null; };
   }, [input, attachments, busy, messages, sessionId, profile, sessionModel, sessionEffort]);
   function key(e) { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }
+  var sessionList = sessions.length ? sessions.map(s => React.createElement("div", { key: s.session_id, className: "wc-session" + (s.session_id === sessionId ? " active" : ""), onClick: () => { loadSession(s.session_id); if (window.innerWidth <= 860) setSidebarOpen(false); } },
+      React.createElement("button", { className: "wc-del", onClick: (e) => deleteSession(s.session_id, e), title: "Delete" }, "×"),
+      React.createElement("div", { className: "wc-session-title" }, s.title || "New chat"),
+      React.createElement("div", { className: "wc-session-prev" }, s.preview || "No messages"),
+      React.createElement("div", { className: "wc-session-time" }, fmtTime(s.updated_at))))
+      : React.createElement("div", { className: "wc-no-sessions" }, "No sessions yet - send a message to start.");
   return React.createElement("div", { className: "wc-root" + (sidebarOpen ? "" : " sidebar-closed"), onPaste: paste, onDragOver: e => { e.preventDefault(); setDrag(true); }, onDragLeave: () => setDrag(false), onDrop: e => { e.preventDefault(); setDrag(false); uploadFiles(e.dataTransfer.files); } },
     React.createElement("div", { className: "wc-sidebar" },
       React.createElement("div", { className: "wc-side-head" },
         React.createElement("span", { className: "wc-side-title" }, "Sessions"),
         React.createElement("button", { className: "wc-new", onClick: newChat }, "+ New")),
-      React.createElement("div", { className: "wc-sessions" },
-        sessions.map(s => React.createElement("div", { key: s.session_id, className: "wc-session" + (s.session_id === sessionId ? " active" : ""), onClick: () => { loadSession(s.session_id); if (window.innerWidth <= 860) setSidebarOpen(false); } },
-          React.createElement("button", { className: "wc-del", onClick: (e) => deleteSession(s.session_id, e), title: "Delete" }, "×"),
-          React.createElement("div", { className: "wc-session-title" }, s.title || "New chat"),
-          React.createElement("div", { className: "wc-session-prev" }, s.preview || "No messages"),
-          React.createElement("div", { className: "wc-session-time" }, fmtTime(s.updated_at)))))),
+      React.createElement("div", { className: "wc-sessions" }, sessionList),
       React.createElement("div", { className: "wc-main" + (drag ? " wc-drop" : "") + (busy || status ? " wc-glowing" : "") },
       React.createElement("div", { className: "wc-top" },
         React.createElement("div", { className: "wc-top-left" },
@@ -457,7 +463,7 @@ function ChatPage() {
             React.createElement("option", { value: "medium" }, "effort: medium"),
             React.createElement("option", { value: "high" }, "effort: high")),
           profile ? React.createElement("span", { className: "wc-profile", title: "Dashboard profile" }, profile) : null,
-          React.createElement("button", { className: "wc-iconbtn", style: { width: 28, height: 28, fontSize: ".8rem" }, onClick: () => setShowInfo(o => !o), title: "About" }, "ⓘ"),
+          React.createElement("button", { className: "wc-iconbtn wc-about", onClick: () => setShowInfo(o => !o), title: "About" }, "ⓘ"),
           showInfo ? React.createElement("div", { className: "wc-info-pop" }, "Web Chat v" + PLUGIN_VERSION, " — streaming, files, clarify. No terminal.") : null)),
       React.createElement("div", { className: "wc-messages", ref: scrollRef },
         messages.length ? messages.map((m, i) => React.createElement(Bubble, { key: i, msg: m }))
@@ -471,7 +477,7 @@ function ChatPage() {
           React.createElement("textarea", { className: "wc-text", value: input, onChange: e => setInput(e.target.value), onKeyDown: key, placeholder: busy ? "Agent is working…" : "Type a message.", disabled: busy, rows: 1, style: { width: "100%" } }),
           attachments.length ? React.createElement("div", { className: "wc-attach" }, attachments.map((a, i) => React.createElement(FileChip, { key: i, path: a.path, onRemove: () => setAttachments(x => x.filter((_, j) => j !== i)) }))) : null),
         React.createElement("button", { className: "wc-iconbtn", onClick: () => fileRef.current && fileRef.current.click(), disabled: busy, title: "Attach file" }, "📎"),
-        React.createElement("button", { className: "wc-iconbtn primary", onClick: () => send(), disabled: busy || (!input.trim() && !attachments.length), title: "Send" }, "➤"))));
+        React.createElement("button", { className: "wc-iconbtn primary", onClick: () => send(), disabled: busy || (!input.trim() && !attachments.length), title: "Send" }, "➤")))));
 }
 
 window.__HERMES_PLUGINS__.register("web-chat", ChatPage);
