@@ -26,7 +26,7 @@ from concurrent.futures import TimeoutError as _FutureTimeout
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
@@ -57,6 +57,9 @@ _ws_by_session: dict[str, WebSocket] = {}
 # stores under the single "qanswer" key. `done` is a threading.Event set when the
 # browser answers (or the timeout fires); the agent thread waits on it.
 _pending_clarify: dict[str, dict[str, Any]] = {}
+# Mirrors web/src/pages/SessionsPage.tsx AUTOMATION_SESSION_SOURCES so the
+# web-chat session list matches the dashboard's default "Chats" filter.
+_AUTOMATION_SESSION_SOURCES = ["cron", "tool", "api_server", "acp", "hermes_flow", "vulcan_delegate", "webhook"]
 _CLARIFY_TIMEOUT = float(os.getenv("HERMES_CHAT_CLARIFY_TIMEOUT", "300"))
 _CLARIFY_WS_LOCK = threading.Lock()
 
@@ -95,6 +98,18 @@ class ClarifyAnswerRequest(BaseModel):
     request_id: str
     answer: Optional[str] = None
     question_id: Optional[str] = None  # qid (q0..q4) for batch shape; None => single-question answer
+
+
+class StopRequest(BaseModel):
+    session_id: str
+
+
+class SessionModelRequest(BaseModel):
+    model: str
+
+
+class RewindRequest(BaseModel):
+    message_id: int
 
 
 def _root() -> Path:
@@ -185,14 +200,15 @@ def _session_source(session_id: str) -> Optional[str]:
     finally:
         db.close()
 
-def _load_session_messages(session_id: str) -> list[dict[str, Any]]:
+def _load_session_messages(session_id: str, profile: Optional[str] = None) -> list[dict[str, Any]]:
     """Read a real session's messages from state.db, mapped to the UI shape.
 
     Only web-chat's own sessions are readable — a desktop/gateway session id
     (e.g. a stale localStorage value from before the source filter existed)
-    must never surface here.
+    must never surface here. ``profile`` scopes to a non-default profile's own
+    state.db (matches the dashboard's management-profile switcher selection).
     """
-    db = _open_db(read_only=True)
+    db = _open_db(profile, read_only=True)
     try:
         sid = db.resolve_session_id(session_id)
         if not sid:
@@ -209,24 +225,35 @@ def _load_session_messages(session_id: str) -> list[dict[str, Any]]:
             content = m.get("content") or m.get("text") or ""
             if isinstance(content, list):
                 content = "\n".join(str(p.get("text", "")) for p in content if isinstance(p, dict))
+            content = str(content).strip()
+            # Tool-call-only assistant turns (finish_reason="tool_calls") have
+            # empty `content` — the desktop hides them; skip so they don't
+            # render as empty bubbles.
+            if not content:
+                continue
             out.append({
+                "id": m.get("id"),
                 "role": role,
-                "text": str(content),
-                "content": str(content),
+                "text": content,
+                "content": content,
                 "timestamp": m.get("timestamp") or m.get("created_at") or time.time(),
             })
         return out
     finally:
         db.close()
 
-def _list_sessions() -> list[dict[str, Any]]:
-    """List ONLY this plugin's sessions (source dashboard-plugin:web-chat) from
-    state.db — never the desktop's or gateway's rows."""
-    db = _open_db(read_only=True)
+def _list_sessions(profile: Optional[str] = None) -> list[dict[str, Any]]:
+    """List sessions the dashboard's "Chats" category would show: every source
+    EXCEPT the automation set (cron/tool/api_server/acp/hermes_flow/
+    vulcan_delegate/webhook) — mirrors web/src/pages/SessionsPage.tsx
+    AUTOMATION_SESSION_SOURCES so this list matches the dashboard 1:1.
+    ``profile`` scopes to the dashboard's currently-selected management
+    profile instead of this plugin process's own profile."""
+    db = _open_db(profile, read_only=True)
     try:
         rows = db.list_sessions_rich(
             limit=50, order_by_last_active=True, compact_rows=True, include_pinned=True,
-            exclude_sources=["cron"])
+            exclude_sources=_AUTOMATION_SESSION_SOURCES)
         out = []
         for s in rows:
             out.append({
@@ -237,6 +264,7 @@ def _list_sessions() -> list[dict[str, Any]]:
                 "updated_at": s.get("last_active") or s.get("updated_at"),
                 "message_count": s.get("message_count") or 0,
                 "source": s.get("source") or "",
+                "model": s.get("model") or "",
             })
         return out
     finally:
@@ -249,12 +277,19 @@ def _tool_label(tool_name: str) -> str:
     return "working"
 
 
-def _ws_send_safe(ws: Optional[WebSocket], payload: dict[str, Any]) -> None:
-    """Send a frame on the event loop from an agent thread."""
+def _ws_send_safe(ws: Optional[WebSocket], payload: dict[str, Any], loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
+    """Send a frame on the event loop from an agent thread.
+
+    ``loop`` MUST be the main-thread event loop captured in the WS handler.
+    Python 3.13's ``asyncio.get_event_loop()`` raises RuntimeError when called
+    from a non-main thread, so we never re-fetch it here — the clarify frame
+    would otherwise be silently dropped and the card never reach the browser.
+    """
     if ws is None:
         return
     try:
-        loop = asyncio.get_event_loop()
+        if loop is None:
+            loop = asyncio.get_event_loop()
         fut = asyncio.run_coroutine_threadsafe(
             ws.send_text(json.dumps(payload, ensure_ascii=False)), loop)
         fut.result(timeout=2)
@@ -268,6 +303,7 @@ def _clarify_block_in_thread(
     choices: Optional[list[str]],
     multi_select: bool,
     questions: Optional[list[dict[str, Any]]] = None,
+    loop: Optional[asyncio.AbstractEventLoop] = None,
 ) -> str:
     """Runs inside the agent thread (blocking). Sends a clarify card frame to the
     browser over the session's plugin WS and blocks until the user answers
@@ -281,6 +317,7 @@ def _clarify_block_in_thread(
     rid = uuid.uuid4().hex
     pending: dict[str, Any] = {
         "ws": None, "answers": {}, "done": threading.Event(), "timed_out": False,
+        "session_id": session_id, "payload": None,
     }
     if questions:
         pending["expected_qids"] = [q.get("qid") for q in questions]
@@ -298,11 +335,12 @@ def _clarify_block_in_thread(
                 "type": "clarify", "request_id": rid, "question": question,
                 "choices": choices, "multi_select": bool(multi_select),
             }
-        _ws_send_safe(ws, payload)
+        pending["payload"] = payload
+        _ws_send_safe(ws, payload, loop)
         if not pending["done"].wait(_CLARIFY_TIMEOUT):
             pending["timed_out"] = True
             try:
-                _ws_send_safe(ws, {"type": "clarify.expire", "request_id": rid})
+                _ws_send_safe(ws, {"type": "clarify.expire", "request_id": rid}, loop)
             except Exception:
                 pass
             return (
@@ -500,8 +538,8 @@ async def profiles():
     return {"profiles": names, "default": os.getenv("HERMES_PROFILE") or "default"}
 
 @router.get("/sessions")
-async def sessions_list():
-    return {"sessions": _list_sessions()}
+async def sessions_list(profile: Optional[str] = Query(None)):
+    return {"sessions": _list_sessions(profile)}
 
 @router.post("/sessions")
 async def sessions_create(req: SessionSaveRequest):
@@ -509,13 +547,22 @@ async def sessions_create(req: SessionSaveRequest):
     return {"session_id": sid, "messages": req.messages, "title": req.title or "New chat"}
 
 @router.get("/sessions/{session_id}")
-async def sessions_get(session_id: str):
+async def sessions_get(session_id: str, profile: Optional[str] = Query(None)):
     if not _valid_session_id(session_id):
         raise HTTPException(status_code=400, detail="invalid session_id")
-    messages = _load_session_messages(session_id)
+    messages = _load_session_messages(session_id, profile)
     if not messages:
         raise HTTPException(status_code=404, detail="session not found")
-    return {"session_id": session_id, "messages": messages, "history": messages}
+    model = ""
+    db = _open_db(profile, read_only=True)
+    try:
+        sid = db.resolve_session_id(session_id)
+        if sid:
+            s = db.get_session(sid)
+            model = (s or {}).get("model") or ""
+    finally:
+        db.close()
+    return {"session_id": session_id, "messages": messages, "history": messages, "model": model}
 
 @router.put("/sessions/{session_id}")
 async def sessions_put(session_id: str, req: SessionSaveRequest):
@@ -523,10 +570,74 @@ async def sessions_put(session_id: str, req: SessionSaveRequest):
     # frontend compatibility (optimistic saves).
     return {"ok": True, "session_id": session_id}
 
+@router.post("/sessions/{session_id}/model")
+async def sessions_set_model(session_id: str, req: SessionModelRequest, profile: Optional[str] = Query(None)):
+    """Persist the per-session model to the session row so the dashboard and
+    web-chat read the SAME source of truth (no more client-side drift)."""
+    if not _valid_session_id(session_id):
+        raise HTTPException(status_code=400, detail="invalid session_id")
+    model = (req.model or "").strip()
+    if not model:
+        raise HTTPException(status_code=400, detail="model is required")
+    db = _open_db(profile, read_only=False)
+    try:
+        sid = db.resolve_session_id(session_id)
+        if not sid:
+            raise HTTPException(status_code=404, detail="session not found")
+        db.update_session_model(sid, model)
+    finally:
+        db.close()
+    return {"ok": True, "session_id": session_id, "model": model}
+
+def _evict_active_agent(session_id: str) -> None:
+    """Drop any cached in-process agent for a session so the next turn rebuilds
+    it from state.db. Agents cache `_session_messages` at creation and never
+    re-sync from the DB (see `_get_active_agent`) -- after a rewind (edit +
+    resend) the cached copy still has the pre-rewind tail, so the very next
+    turn would silently resurrect the "edited away" messages into the model's
+    context even though the UI shows them gone. Eviction is the fix, not a
+    _session_messages patch, because the agent may also hold other per-turn
+    state (tool call ids, etc.) tied to the stale transcript."""
+    agent = _active_agents.pop(session_id, None)
+    _active_agent_profiles.pop(session_id, None)
+    _active_agent_models.pop(session_id, None)
+    old_db = _active_agent_dbs.pop(session_id, None)
+    if old_db is not None:
+        try: old_db.close()
+        except Exception: pass
+    if agent is not None:
+        close = getattr(agent, "close", None)
+        if callable(close):
+            try: close()
+            except Exception: pass
+
+
+@router.post("/sessions/{session_id}/rewind")
+async def sessions_rewind(session_id: str, req: RewindRequest, profile: Optional[str] = Query(None)):
+    """Rewind (soft-delete) a user message and everything after it -- the
+    edit-and-resend workflow. The caller re-sends the edited text as a normal
+    new message afterward; this endpoint only truncates the transcript."""
+    if not _valid_session_id(session_id):
+        raise HTTPException(status_code=400, detail="invalid session_id")
+    db = _open_db(profile, read_only=False)
+    try:
+        sid = db.resolve_session_id(session_id)
+        if not sid:
+            raise HTTPException(status_code=404, detail="session not found")
+        try:
+            result = db.rewind_to_message(sid, req.message_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        db.close()
+    _evict_active_agent(session_id)
+    return {"ok": True, "session_id": session_id, "rewound_count": result.get("rewound_count", 0)}
+
+
 @router.delete("/sessions/{session_id}")
-async def sessions_delete(session_id: str):
+async def sessions_delete(session_id: str, profile: Optional[str] = Query(None)):
     if not _valid_session_id(session_id): raise HTTPException(status_code=400, detail="invalid session_id")
-    db = _open_db(read_only=False)
+    db = _open_db(profile, read_only=False)
     try:
         sid = db.resolve_session_id(session_id)
         if sid:
@@ -555,6 +666,20 @@ async def upload(file: UploadFile = File(...), session_id: str = Form(...)):
         warning = "Potentially executable file uploaded; inspect before running."
     return {"ok": True, "session_id": sid, "filename": dest.name, "original_filename": file.filename, "path": str(dest), "url": f"/api/plugins/web-chat/file?path={dest}", "type": typ, "content_type": file.content_type, "size": len(raw), "warning": warning}
 
+@router.get("/pending_clarify")
+async def pending_clarify(session_id: str):
+    """Recovery endpoint: a reconnected/reloaded client for this session polls this
+    to find a clarify question that is blocking the agent thread but whose original
+    delivery (over a since-dropped WS) never reached the browser. Returns the exact
+    frame shape the WS would have sent, so the frontend can setClarify() it directly."""
+    if not _valid_session_id(session_id):
+        raise HTTPException(status_code=400, detail="invalid session_id")
+    for rid, pending in list(_pending_clarify.items()):
+        if pending.get("session_id") == session_id and pending.get("payload") and not pending["done"].is_set():
+            return {"pending": True, "request_id": rid, "frame": pending["payload"]}
+    return {"pending": False}
+
+
 @router.post("/clarify")
 async def clarify_answer(req: ClarifyAnswerRequest):
     """Answer an in-flight clarify card (virgil-style round trip). The agent
@@ -563,14 +688,17 @@ async def clarify_answer(req: ClarifyAnswerRequest):
     pending = _pending_clarify.get(rid)
     if not pending:
         raise HTTPException(status_code=404, detail="no pending clarify for this request id (expired?)")
-    if req.question_id:
-        pending["answers"][req.question_id] = req.answer or ""
-        expected = pending.get("expected_qids")
-        if expected and all(q in pending["answers"] for q in expected):
-            pending["done"].set()
-        elif not expected:
+    expected = pending.get("expected_qids")
+    if expected:
+        # Batch shape: key answers by qid; done once every expected qid is in.
+        if req.question_id:
+            pending["answers"][req.question_id] = req.answer or ""
+        if all(q in pending["answers"] for q in expected):
             pending["done"].set()
     else:
+        # Single-question path: the frontend synthesizes qid "q0" and sends it
+        # as question_id, but _clarify_block_in_thread reads the answer back
+        # under "qanswer". Store there so the answer is not lost.
         pending["answers"]["qanswer"] = req.answer or ""
         pending["done"].set()
     return {"ok": True, "request_id": rid}
@@ -611,6 +739,23 @@ async def clear_uploads(session_id: str):
     up = _uploads_root() / session_id
     if up.exists() and _is_inside(up, _uploads_root()): shutil.rmtree(up)
     return {"ok": True}
+
+@router.post("/stop")
+async def stop(req: StopRequest):
+    """Interrupt the in-flight agent turn for a session (hard cancel)."""
+    agent = _active_agents.get(req.session_id)
+    if agent is None:
+        return {"ok": False, "reason": "no active agent"}
+    try:
+        interrupt = getattr(agent, "interrupt", None)
+        if not callable(interrupt):
+            return {"ok": False, "reason": "agent has no interrupt()"}
+        interrupt(hard_cancel=True)
+        return {"ok": True}
+    except Exception as exc:
+        log.exception("web-chat stop failed")
+        return {"ok": False, "reason": str(exc)}
+
 
 @router.websocket("/stream")
 async def stream_ws(ws: WebSocket) -> None:
@@ -654,7 +799,7 @@ async def stream_ws(ws: WebSocket) -> None:
         # Runs on the agent thread; blocks until the browser answers the card
         # or the timeout fires. `questions` (batch shape) wins when non-empty.
         return _clarify_block_in_thread(
-            session_id, question, choices, multi_select, questions=questions)
+            session_id, question, choices, multi_select, questions=questions, loop=loop)
 
     _register_ws(session_id, ws)
 
@@ -675,6 +820,24 @@ async def stream_ws(ws: WebSocket) -> None:
                 default_provider = cfg_get(cfg, "model", "provider", default=None)
                 use_model = model or default_model
                 use_provider = default_provider
+                # The per-chat model picker lists models across EVERY configured provider
+                # (see /api/model/options), but the frontend sends back only a bare model
+                # id -- no provider. Blindly using the global default_provider here breaks
+                # every non-default-provider pick: e.g. selecting an anthropic model while
+                # the daily driver is ollama-cloud sent claude-sonnet-5 to ollama-cloud,
+                # which 404'd "model not found" on every retry with no visible chat
+                # response (the error only reached a log/status frame, not a message
+                # bubble -- the message appears sent but the agent never replies).
+                # Auto-detect the real provider for an explicitly-picked non-default
+                # model, same helper the TUI's /model command uses for this scenario.
+                if use_model and use_model != default_model:
+                    try:
+                        from hermes_cli.models import detect_provider_for_model
+                        detected = detect_provider_for_model(use_model, default_provider or "")
+                        if detected:
+                            use_provider, use_model = detected
+                    except Exception:
+                        log.debug("web-chat: provider auto-detect failed for model=%s", use_model, exc_info=True)
                 # Effort: explicit per-turn override wins; else the config's
                 # resolved reasoning config (per-model override > global).
                 reasoning_config = None
