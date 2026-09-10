@@ -323,8 +323,28 @@ function ChatPage() {
   var [sessions, setSessions] = useState([]);
   var [messages, setMessages] = useState([]);
   var [input, setInput] = useState("");
-  var [busy, setBusy] = useState(false);
-  var [status, setStatus] = useState(null);
+  // busy/status/clarify are PER-SESSION, not global -- a chat streaming in
+  // session A must never block sending in session B or a brand-new chat.
+  // Each is a {session_id: value} map; the scalars below are just the
+  // CURRENTLY VIEWED session's slice, derived every render.
+  var [busyMap, setBusyMap] = useState({});
+  var [statusMap, setStatusMap] = useState({});
+  var [clarifyMap, setClarifyMap] = useState({});
+  var busy = !!busyMap[sessionId];
+  var status = statusMap[sessionId] || null;
+  var clarify = clarifyMap[sessionId] || null;
+  function setBusyFor(sid, val) { setBusyMap(m => { var n = Object.assign({}, m); if (val) n[sid] = true; else delete n[sid]; return n; }); }
+  function setStatusFor(sid, val) { setStatusMap(m => { var n = Object.assign({}, m); if (val) n[sid] = val; else delete n[sid]; return n; }); }
+  function setClarifyFor(sid, val) { setClarifyMap(m => { var n = Object.assign({}, m); if (val) n[sid] = val; else delete n[sid]; return n; }); }
+  // Migrate a per-session map entry from oldKey to newKey, used when the
+  // backend renames a brand-new client-minted session id to its canonical
+  // server id (see the "session" frame handler in send()) -- without this,
+  // the busy/status flag set under the pre-rename id becomes invisible the
+  // instant React's sessionId state flips to the canonical id.
+  function renameKey(setter, oldKey, newKey, fallback) {
+    if (oldKey === newKey) return;
+    setter(m => { var n = Object.assign({}, m); var v = n[oldKey]; delete n[oldKey]; n[newKey] = v !== undefined ? v : fallback; return n; });
+  }
   var [error, setError] = useState(null);
   var [attachments, setAttachments] = useState([]);
   var [drag, setDrag] = useState(false);
@@ -334,19 +354,23 @@ function ChatPage() {
   var [sessionModel, setSessionModel] = useState({});
   var [sessionEffort, setSessionEffort] = useState({});
   var [sessionsOpen, setSessionsOpen] = useState(false);
-  var [clarify, setClarify] = useState(null);
   var [confirmDel, setConfirmDel] = useState(null);
   var [atBottom, setAtBottom] = useState(true);
   var [editingIdx, setEditingIdx] = useState(null);
   var [editText, setEditText] = useState("");
-  var scrollRef = useRef(null), fileRef = useRef(null), wsRef = useRef(null), inputRef = useRef(null);
+  var scrollRef = useRef(null), fileRef = useRef(null), inputRef = useRef(null);
+  // One WebSocket per session id, so a background session's stream keeps
+  // running (and can be individually stopped) while another is viewed.
+  var wsMapRef = useRef({});
   var pendingScrollRef = useRef(false);
   // Tracks "was the user at the bottom" from the LAST real scroll event, not
   // recomputed after new content already grew the DOM -- see the fix note
   // on the auto-scroll effect below for why the naive post-hoc check breaks.
   var atBottomRef = useRef(true);
   function autosize(el) { if (!el) return; el.style.height = "auto"; el.style.height = Math.min(132, Math.max(44, el.scrollHeight)) + "px"; }
-  var streamingRef = useRef("");
+  // Per-session accumulated streaming text -- a single shared ref would
+  // interleave/corrupt text if two sessions stream concurrently.
+  var streamingMapRef = useRef({});
   var messagesRef = useRef([]);
   useEffect(() => { messagesRef.current = messages; }, [messages]);
   var sessionIdRef = useRef(sessionId);
@@ -359,11 +383,11 @@ function ChatPage() {
   // fix class as virgil's whisperClarify stash/replay (see hermes-chat-frontend skill).
   function checkPendingClarify(id) {
     afetch(withProfile(api("/pending_clarify?session_id=" + encodeURIComponent(id)))).then(r => r.ok ? r.json() : null).then(d => {
-      if (d && d.pending && d.frame) setClarify(d.frame);
+      if (d && d.pending && d.frame) setClarifyFor(id, d.frame);
     }).catch(() => { });
   }
   function loadSession(id) {
-    setError(null); setClarify(null); setStatus(null); setEditingIdx(null); setEditText("");
+    setError(null); setEditingIdx(null); setEditText("");
     afetch(withProfile(api("/sessions/" + encodeURIComponent(id)))).then(r => r.ok ? r.json() : Promise.reject()).then(d => {
       sessionIdRef.current = id;
       setSessionId(id); localStorage.setItem("web-chat.session_id", id);
@@ -469,7 +493,7 @@ function ChatPage() {
           var fresh = uuid();
           sessionIdRef.current = fresh;
           setSessionId(fresh); localStorage.setItem("web-chat.session_id", fresh);
-          setMessages([]); setAttachments([]); setClarify(null); setError(null);
+          setMessages([]); setAttachments([]); setClarifyFor(fresh, null); setError(null);
         } else {
           loadSession(sessionIdRef.current);
         }
@@ -528,7 +552,7 @@ function ChatPage() {
   }, [messages, status, clarify, sessionId]);
   useEffect(() => { autosize(inputRef.current); }, [input]);
   function saveLocal(id, msgs) { afetch(withProfile(api("/sessions/" + encodeURIComponent(id))), { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messages: msgs }) }).then(loadSessions).catch(() => { }); }
-  function newChat() { var id = uuid(); sessionIdRef.current = id; setSessionId(id); localStorage.setItem("web-chat.session_id", id); setMessages([]); setAttachments([]); setInput(""); setClarify(null); setError(null); setSessionsOpen(false); setEditingIdx(null); setEditText(""); }
+  function newChat() { var id = uuid(); sessionIdRef.current = id; setSessionId(id); localStorage.setItem("web-chat.session_id", id); setMessages([]); setAttachments([]); setInput(""); setClarifyFor(id, null); setError(null); setSessionsOpen(false); setEditingIdx(null); setEditText(""); }
   function deleteSession(id, e) { e.stopPropagation(); afetch(withProfile(api("/sessions/" + encodeURIComponent(id))), { method: "DELETE" }).then(() => { loadSessions(); if (id === sessionId) newChat(); }); }
   function uploadFiles(files) {
     Array.from(files || []).forEach(file => {
@@ -578,54 +602,77 @@ function ChatPage() {
   }
   function stop() {
     afetch(api("/stop"), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: sessionId }) }).catch(() => { });
-    if (wsRef.current) { try { wsRef.current.close(); } catch (e) { } }
-    setBusy(false); setStatus(null);
+    var ws = wsMapRef.current[sessionId];
+    if (ws) { try { ws.close(); } catch (e) { } }
+    setBusyFor(sessionId, false); setStatusFor(sessionId, null);
   }
-  var send = useCallback(function (textOverride, baseMessagesOverride) {
+  // Sends in whatever session is CURRENTLY VIEWED when send() is called
+  // (captured into `sid` immediately), but every callback below keys off
+  // `sid`/`streamSid` -- never the live `sessionId` state -- so switching
+  // away to another chat, or opening a brand-new one, never blocks or
+  // corrupts this stream: each session has its own busy flag, status,
+  // clarify card, streaming buffer, and WebSocket entry.
+  var send = useCallback(function (textOverride, baseMessagesOverride, sidOverride) {
+    var sid = sidOverride || sessionId;
     var text = (textOverride !== undefined ? textOverride : input).trim();
-    if ((!text && !attachments.length) || busy) return;
-    var base = baseMessagesOverride !== undefined ? baseMessagesOverride : messages;
-    var sid = sessionId;
+    if ((!text && !attachments.length) || busyMap[sid]) return;
+    var base = baseMessagesOverride !== undefined ? baseMessagesOverride : (sid === sessionId ? messages : []);
     var streamSid = sid;
     var mediaText = attachments.map(a => "MEDIA:" + a.path).join("\n");
     var full = [text, mediaText].filter(Boolean).join("\n");
     var userMsg = { role: "user", text: full, timestamp: Date.now() / 1000, attachments: attachments };
     var next = base.concat([userMsg]);
-    pendingScrollRef.current = true;
-    setMessages(next); saveLocal(sessionId, next);
-    setInput(""); setAttachments([]); setBusy(true); setStatus("thinking"); setError(null); setClarify(null);
-    streamingRef.current = "";
+    if (sid === sessionId) { pendingScrollRef.current = true; setMessages(next); }
+    saveLocal(sid, next);
+    if (sid === sessionId) { setInput(""); setAttachments([]); }
+    setBusyFor(sid, true); setStatusFor(sid, "thinking"); setError(null); setClarifyFor(sid, null);
+    streamingMapRef.current[sid] = "";
     var chunks = [];
     var ws = new WebSocket(wsUrl("/stream"));
-    wsRef.current = ws;
-    ws.onopen = function () { ws.send(JSON.stringify({ type: "message", text: full, session_id: sessionId, profile: profile, model: sessionModel[sessionId] || defaultModel, effort: sessionEffort[sessionId] || "", attachments: attachments })); };
+    wsMapRef.current[sid] = ws;
+    ws.onopen = function () { ws.send(JSON.stringify({ type: "message", text: full, session_id: sid, profile: profile, model: sessionModel[sid] || defaultModel, effort: sessionEffort[sid] || "", attachments: attachments })); };
     ws.onmessage = function (evt) {
       var f; try { f = JSON.parse(evt.data); } catch (e) { return; }
       if (f.type === "session" && f.session_id) {
+        var oldSid = streamSid;
         streamSid = f.session_id;
+        // The backend may rename a brand-new client-minted id to its
+        // canonical server id -- migrate this stream's map entries so the
+        // busy/status/clarify/ws bookkeeping stays reachable under the new
+        // key (an unmigrated entry would look like the stream vanished,
+        // even though it's still running).
+        if (oldSid !== streamSid) {
+          renameKey(setBusyMap, oldSid, streamSid, true);
+          renameKey(setStatusMap, oldSid, streamSid, "thinking");
+          renameKey(setClarifyMap, oldSid, streamSid, null);
+          wsMapRef.current[streamSid] = wsMapRef.current[oldSid]; delete wsMapRef.current[oldSid];
+          streamingMapRef.current[streamSid] = streamingMapRef.current[oldSid] || ""; delete streamingMapRef.current[oldSid];
+        }
         if (sessionIdRef.current === sid) { setSessionId(f.session_id); localStorage.setItem("web-chat.session_id", f.session_id); }
         return;
       }
-      if (sessionIdRef.current !== streamSid) return;
-      if (f.type === "status") setStatus(f.label || null);
+      if (f.type === "status") setStatusFor(streamSid, f.label || null);
       else if (f.type === "delta") {
         chunks.push(f.text || "");
-        streamingRef.current += (f.text || "");
-        setMessages(next.concat([{ role: "assistant", text: streamingRef.current, timestamp: Date.now() / 1000, streaming: true }]));
+        streamingMapRef.current[streamSid] = (streamingMapRef.current[streamSid] || "") + (f.text || "");
+        if (sessionIdRef.current === streamSid) {
+          setMessages(next.concat([{ role: "assistant", text: streamingMapRef.current[streamSid], timestamp: Date.now() / 1000, streaming: true }]));
+        }
       }
-      else if (f.type === "clarify") { setClarify(f); setStatus(null); }
-      else if (f.type === "clarify.expire") { setClarify(null); setStatus("thinking"); }
+      else if (f.type === "clarify") { setClarifyFor(streamSid, f); setStatusFor(streamSid, null); }
+      else if (f.type === "clarify.expire") { setClarifyFor(streamSid, null); setStatusFor(streamSid, "thinking"); }
       else if (f.type === "done") {
         var final = f.text || chunks.join("");
         var doneMsgs = next.concat([{ role: "assistant", text: final, timestamp: Date.now() / 1000, attachments: [] }]);
-        setMessages(doneMsgs); saveLocal(f.session_id || streamSid, doneMsgs); setStatus(null); setClarify(null); loadSessions();
+        if (sessionIdRef.current === streamSid) setMessages(doneMsgs);
+        saveLocal(f.session_id || streamSid, doneMsgs); setStatusFor(streamSid, null); setClarifyFor(streamSid, null); loadSessions();
       }
-      else if (f.type === "clear") setStatus(null);
-      else if (f.type === "error") { setError(f.text || "Agent error"); setStatus(null); }
+      else if (f.type === "clear") setStatusFor(streamSid, null);
+      else if (f.type === "error") { if (sessionIdRef.current === streamSid) setError(f.text || "Agent error"); setStatusFor(streamSid, null); }
     };
-    ws.onerror = function () { if (sessionIdRef.current !== streamSid) return; setError("Connection error. Restart dashboard and retry if the plugin was just updated."); setBusy(false); setStatus(null); };
-    ws.onclose = function () { if (wsRef.current === ws) wsRef.current = null; setBusy(false); if (sessionIdRef.current === streamSid) setStatus(null); };
-  }, [input, attachments, busy, messages, sessionId, profile, sessionModel, sessionEffort]);
+    ws.onerror = function () { if (sessionIdRef.current === streamSid) setError("Connection error. Restart dashboard and retry if the plugin was just updated."); setBusyFor(streamSid, false); setStatusFor(streamSid, null); };
+    ws.onclose = function () { if (wsMapRef.current[streamSid] === ws) delete wsMapRef.current[streamSid]; setBusyFor(streamSid, false); setStatusFor(streamSid, null); };
+  }, [input, attachments, busyMap, messages, sessionId, profile, sessionModel, sessionEffort]);
   function key(e) { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(); } }
   var current = sessions.find(s => s.session_id === sessionId) || {};
   var sessionList = sessions.length ? sessions.map(s => React.createElement("div", { key: s.session_id, className: "wc-session" + (s.session_id === sessionId ? " active" : ""), onClick: () => { loadSession(s.session_id); setSessionsOpen(false); } },
