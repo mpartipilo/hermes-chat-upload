@@ -349,9 +349,16 @@ function ClarifyCard({ frame, onAnswer }) {
   function answer(qid, raw) {
     var next = Object.assign({}, answers, { [qid]: raw });
     setAnswers(next);
-    onAnswer(frame.request_id, qid, raw);
-    if (questions.length === 1) setDone(true);
-    else if (Object.keys(next).length >= questions.length) setDone(true);
+    var allDone = questions.length === 1 || Object.keys(next).length >= questions.length;
+    // Tell the parent whether every question on this card is now answered, so
+    // it can clear its OWN (persistent, cross-remount) clarify state right
+    // away -- see answerClarify: waiting for a server "clarify.expire"/next
+    // "clarify"/"done" frame to do that is unreliable (dead WS, or this tab
+    // recovered the session via the REST-only watchRemoteBusy path with no
+    // live socket at all) and left the UI stuck showing a stale answered
+    // card that even reverted to "unanswered" on a session-switch remount.
+    onAnswer(frame.request_id, qid, raw, allDone);
+    if (allDone) setDone(true);
   }
   function submitOther(qid) {
     var v = (others[qid] || "").trim();
@@ -672,7 +679,16 @@ function ChatPage() {
       syncProfile();
       loadSessions();
       if (!busy) refreshMessages(sessionId);
-      if (!busy && !clarify) checkPendingClarify(sessionId);
+      // Deliberately NOT gated on !busy: a session recovered via
+      // watchRemoteBusy (another tab/device, or this tab after a reload) is
+      // marked busy=true for its ENTIRE wait, including while the agent is
+      // blocked on a clarify question -- with no live WS of its own to ever
+      // deliver a "clarify" frame. Skipping this poll while busy left the
+      // card invisible until the user forced a loadSession() (switch chats
+      // and back), which is the only OTHER call site that checks
+      // unconditionally. Still gated on !clarify so we don't clobber a card
+      // already showing / mid-answer.
+      if (!clarify) checkPendingClarify(sessionId);
     }
     function onVis() { if (!document.hidden) sync(); }
     function onFocus() { sync(); }
@@ -683,7 +699,7 @@ function ChatPage() {
       syncProfile();
       loadSessions();
       if (!busy) refreshMessages(sessionId);
-      if (!busy && !clarify) checkPendingClarify(sessionId);
+      if (!clarify) checkPendingClarify(sessionId);
     }, 5000);
     return () => {
       document.removeEventListener("visibilitychange", onVis);
@@ -757,8 +773,21 @@ function ChatPage() {
     for (var i = 0; i < items.length; i++) { if (items[i].kind === "file") files.push(items[i].getAsFile()); }
     if (files.length) { e.preventDefault(); uploadFiles(files); }
   }
-  function answerClarify(requestId, qid, answer) {
+  function answerClarify(requestId, qid, answer, allDone) {
     afetch(api("/clarify"), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ request_id: requestId, answer: answer, question_id: qid }) }).catch(() => { });
+    // Clear our own clarify state the instant every question on the card is
+    // answered -- do NOT wait for a server-pushed "clarify.expire"/"clarify"/
+    // "done" frame to do it (see ClarifyCard.answer comment): that push can
+    // be lost to a dead/backgrounded WS, or never exist at all when this
+    // session was recovered via the REST-only watchRemoteBusy poll. Without
+    // this, clarifyMap[sessionId] stays set to the old (now-answered) frame
+    // forever, so switching away and back remounts a fresh ClarifyCard with
+    // done=false against that same stale frame -- looks "unanswered again".
+    if (allDone) {
+      setClarifyFor(sessionId, null);
+      setPendingClarifySessions(ids => ids.filter(x => x !== sessionId));
+      if (!busy) setStatusFor(sessionId, "thinking");
+    }
   }
   var startEdit = useCallback(function (idx) {
     if (busy) return;

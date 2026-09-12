@@ -38,3 +38,4 @@ sessions/
 # OS
 Thumbs.db
 perf/
+.venv2/
