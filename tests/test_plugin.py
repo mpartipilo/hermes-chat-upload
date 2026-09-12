@@ -214,3 +214,25 @@ def test_perf_read_respects_since_window(api, tmp_path):
     recent = api._perf_read("client.jsonl", since_s=_time.time() - 60)
     assert len(recent) == 1
     assert recent[0]["p95_ms"] == 5.0
+
+
+def test_perf_summary_separates_longtask_and_session_switch(api, client):
+    client.post("/perf/client", json={"event": "keystroke", "p95_ms": 10.0, "count": 5})
+    client.post("/perf/client", json={"event": "longtask", "p95_ms": 120.0, "count": 3})
+    client.post("/perf/client", json={"event": "session_switch", "p95_ms": 300.0, "count": 2})
+    r = client.get("/perf/summary", params={"hours": 24})
+    body = r.json()
+    assert body["client_keystroke_p95_ms"]["p95_ms"] == 10.0
+    assert body["client_longtask_p95_ms"]["p95_ms"] == 120.0
+    assert body["client_session_switch_p95_ms"]["p95_ms"] == 300.0
+
+
+def test_perf_summary_marks_backend_turn_stats_informational(api, client):
+    r = client.get("/perf/summary", params={"hours": 24})
+    body = r.json()
+    assert "turn_total_ms_informational" in body
+    assert "turn_first_delta_ms_informational" in body
+    # Old non-suffixed keys must be gone -- a consumer reading the un-suffixed
+    # name would silently treat backend noise as a UI regression signal.
+    assert "turn_total_ms" not in body
+    assert "turn_first_delta_ms" not in body

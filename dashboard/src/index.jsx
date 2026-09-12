@@ -49,7 +49,7 @@ button{touch-action:manipulation;font-family:inherit}
 .wc-settings-label{font-size:11px;color:var(--wc-muted);font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin-top:2px}
 .wc-sel{width:100%;height:32px;border:1px solid var(--wc-border);background:var(--wc-card2);color:var(--wc-fg);border-radius:4px;padding:0 8px;font-size:13px;font-family:inherit}
 .wc-sel:focus{outline:none;border-color:var(--wc-accent)}
-.wc-messages{flex:1;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:10px 8px;display:flex;flex-direction:column;gap:8px}
+.wc-messages{flex:1;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:10px 8px;display:flex;flex-direction:column;gap:8px;contain:layout style}
 .wc-jump{position:sticky;bottom:8px;align-self:flex-end;width:36px;height:36px;border-radius:50%;background:var(--wc-accent-strong);color:var(--wc-accent-ink);border:none;font-size:18px;cursor:pointer;box-shadow:0 2px 8px rgb(0 0 0/.4);display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:-44px}
 .wc-row{display:flex;gap:6px;max-width:100%}
 .wc-row.user{justify-content:flex-end}
@@ -82,7 +82,7 @@ button{touch-action:manipulation;font-family:inherit}
 @keyframes wc-blink{0%,80%,100%{opacity:.25}40%{opacity:1}}
 .wc-status{display:flex;align-items:center;gap:6px;padding:4px 10px;color:var(--wc-muted);font-size:12px;flex-shrink:0}
 .wc-error{margin:0 10px 6px;padding:8px 10px;background:rgba(248,113,113,.1);color:var(--wc-danger);border-radius:4px;font-size:13px;border:1px solid rgba(248,113,113,.3)}
-.wc-inputbar{display:flex;align-items:flex-end;gap:6px;padding:8px 10px;padding-bottom:calc(8px + env(safe-area-inset-bottom,0px));border-top:1px solid var(--wc-border);background:var(--wc-card);flex-shrink:0}
+.wc-inputbar{display:flex;align-items:flex-end;gap:6px;padding:8px 10px;padding-bottom:calc(8px + env(safe-area-inset-bottom,0px));border-top:1px solid var(--wc-border);background:var(--wc-card);flex-shrink:0;contain:layout}
 .wc-inputbar textarea{flex:1;min-height:40px;max-height:132px;resize:none;border:1px solid var(--wc-border);background:var(--wc-bg);color:var(--wc-fg);border-radius:6px;padding:9px 10px;font-size:15px;font-family:inherit;line-height:1.4;outline:none}
 .wc-inputbar textarea:focus{border-color:var(--wc-accent)}
 .wc-attach{display:flex;flex-wrap:wrap;gap:4px;padding:4px 0 0}
@@ -190,16 +190,26 @@ function sourceLabel(src) {
 function uuid() { return (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random()).replace(/[^A-Za-z0-9_.-]/g, "-"); }
 
 // --- Perf tracker -----------------------------------------------------
-// Measures keystroke-to-paint latency (keydown -> next animation frame),
-// which is the "typing feels laggy" complaint made concrete: it captures
-// exactly the render+reflow cost triggered by that keystroke, including
-// markdown re-parsing of unrelated messages if memoization regresses.
-// Samples are batched client-side (NEVER one network call per keystroke --
-// that would itself be the perf bug) and flushed periodically as a single
-// p50/p95/max beacon to /perf/client for the cron watchdog to trend.
+// Frontend is the actual complaint surface ("typing is laggy") -- backend
+// turn time is left alone as informational-only (varies wildly with what
+// the agent is doing, not a UI regression signal). Three independent
+// client-side measurements, each batched and flushed on its own timer
+// (NEVER one network call per keystroke/frame -- that would itself be the
+// perf bug):
+//
+// 1. keystroke   -- keydown -> next-paint latency (2x rAF). Concrete "typing
+//    feels laggy" number: render+reflow cost of THIS keystroke, including
+//    markdown re-parse of unrelated messages if memoization regresses.
+// 2. longtask    -- PerformanceObserver('longtask'): browser-native signal
+//    for "main thread blocked >=50ms", the actual definition of jank. Catches
+//    background jank (re-renders during streaming, etc.) that keystroke
+//    timing alone would miss if the user isn't typing at that moment.
+// 3. session_switch -- time from clicking a session in the sidebar to its
+//    messages actually painting. The other big "feels slow" moment besides
+//    typing.
 var PerfTracker = (function () {
-  var samples = [];
-  var flushTimer = null;
+  var buffers = { keystroke: [], longtask: [], session_switch: [] };
+  var flushTimers = {};
   var FLUSH_MS = 20000, MAX_BUFFERED = 200;
   function percentile(arr, p) {
     if (!arr.length) return 0;
@@ -207,33 +217,60 @@ var PerfTracker = (function () {
     var idx = Math.min(s.length - 1, Math.floor((s.length - 1) * p));
     return s[idx];
   }
-  function flush(messageCount) {
-    if (!samples.length) return;
-    var batch = samples; samples = [];
-    var payload = {
-      event: "keystroke",
+  function scheduleFlush(event, extra) {
+    if (flushTimers[event]) return;
+    flushTimers[event] = setTimeout(function () {
+      flushTimers[event] = null;
+      flush(event, extra);
+    }, FLUSH_MS);
+  }
+  function flush(event, extra) {
+    var batch = buffers[event]; buffers[event] = [];
+    if (!batch.length) return;
+    var payload = Object.assign({
+      event: event,
       p50_ms: Math.round(percentile(batch, 0.5) * 10) / 10,
       p95_ms: Math.round(percentile(batch, 0.95) * 10) / 10,
       max_ms: Math.round(Math.max.apply(null, batch) * 10) / 10,
       count: batch.length,
-      message_count: messageCount || 0,
-    };
+    }, extra || {});
     try {
       afetch(api("/perf/client"), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }).catch(function () { });
-    } catch (e) { /* perf reporting must never break typing */ }
+    } catch (e) { /* perf reporting must never break the UI */ }
   }
+  function push(event, ms, messageCount) {
+    var buf = buffers[event];
+    buf.push(ms);
+    if (buf.length > MAX_BUFFERED) buf.shift();
+    scheduleFlush(event, { message_count: messageCount || 0 });
+  }
+  // Long-task observer: fires for every main-thread task >=50ms, independent
+  // of any user action -- the closest thing a browser exposes to "the UI just
+  // froze". Not supported in every engine; no-op (not a crash) when absent.
+  try {
+    if (typeof PerformanceObserver !== "undefined" && PerformanceObserver.supportedEntryTypes && PerformanceObserver.supportedEntryTypes.indexOf("longtask") !== -1) {
+      new PerformanceObserver(function (list) {
+        list.getEntries().forEach(function (entry) { push("longtask", entry.duration); });
+      }).observe({ type: "longtask", buffered: true });
+    }
+  } catch (e) { /* longtask unsupported (Safari/Firefox) -- keystroke + session_switch still cover it */ }
   return {
     markKeydown: function (messageCount) {
       var t0 = performance.now();
       requestAnimationFrame(function () {
-        requestAnimationFrame(function () {
-          samples.push(performance.now() - t0);
-          if (samples.length > MAX_BUFFERED) samples.shift();
-          if (!flushTimer) flushTimer = setTimeout(function () { flushTimer = null; flush(messageCount); }, FLUSH_MS);
-        });
+        requestAnimationFrame(function () { push("keystroke", performance.now() - t0, messageCount); });
       });
     },
-    flushNow: flush,
+    // Call at the moment a session switch is requested; returns a function to
+    // call once the new session's messages are in the DOM (next paint).
+    startSessionSwitch: function () {
+      var t0 = performance.now();
+      return function () {
+        requestAnimationFrame(function () {
+          requestAnimationFrame(function () { push("session_switch", performance.now() - t0); });
+        });
+      };
+    },
   };
 })();
 function stripRec(s) { return String(s || "").replace(/\s*\(Recommended\)\s*$/i, ""); }
@@ -432,7 +469,24 @@ function ChatPage() {
   // recomputed after new content already grew the DOM -- see the fix note
   // on the auto-scroll effect below for why the naive post-hoc check breaks.
   var atBottomRef = useRef(true);
-  function autosize(el) { if (!el) return; el.style.height = "auto"; el.style.height = Math.min(132, Math.max(44, el.scrollHeight)) + "px"; }
+  // Read-after-write (style.height="auto" then reading scrollHeight) forces a
+  // synchronous layout flush on every keystroke. `.wc-messages` now carries
+  // `contain:layout style` so that flush stays scoped to the input bar
+  // instead of re-laying-out the whole message list -- this was the real
+  // regression: live perf beacons showed keystroke p95 climbing with
+  // message_count even after the markdown-render memoization fix, which only
+  // helps React's own re-render, not this direct DOM layout thrash. See
+  // PERF_PROFILER.md. Height-unchanged guard below just skips a redundant
+  // write on top (most keystrokes don't change line count).
+  var lastAutosizeHeight = null;
+  function autosize(el) {
+    if (!el) return;
+    el.style.height = "auto";
+    var next = Math.min(132, Math.max(44, el.scrollHeight));
+    if (next === lastAutosizeHeight) return;
+    lastAutosizeHeight = next;
+    el.style.height = next + "px";
+  }
   // Per-session accumulated streaming text -- a single shared ref would
   // interleave/corrupt text if two sessions stream concurrently.
   var streamingMapRef = useRef({});
@@ -453,11 +507,13 @@ function ChatPage() {
   }
   function loadSession(id) {
     setError(null); setEditingIdx(null); setEditText("");
+    var perfDone = PerfTracker.startSessionSwitch();
     afetch(withProfile(api("/sessions/" + encodeURIComponent(id)))).then(r => r.ok ? r.json() : Promise.reject()).then(d => {
       sessionIdRef.current = id;
       setSessionId(id); localStorage.setItem("web-chat.session_id", id);
       pendingScrollRef.current = true;
       setMessages(d.messages || d.history || []); setAttachments([]);
+      perfDone();
       checkPendingClarify(id);
       // Model is now a server-side per-session property (state.db `model`
       // column). Prefer the persisted value; fall back to the dashboard's

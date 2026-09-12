@@ -118,9 +118,11 @@ class RewindRequest(BaseModel):
 
 
 class ClientPerfRequest(BaseModel):
-    # Frontend keystroke-to-paint samples, aggregated client-side before
-    # sending (never one beacon per keystroke -- see PERF.md). p50/p95 are in
-    # milliseconds; count is how many raw samples were folded into this batch.
+    # Frontend perf samples, aggregated client-side before sending (never one
+    # beacon per event -- see PERF_PROFILER.md). event is one of "keystroke"
+    # (keydown-to-paint), "longtask" (PerformanceObserver long-task, >=50ms
+    # main-thread block), or "session_switch" (sidebar click to messages
+    # painted). p50/p95/max are milliseconds; count = raw samples in this batch.
     event: str = "keystroke"
     p50_ms: float = 0.0
     p95_ms: float = 0.0
@@ -734,24 +736,37 @@ async def perf_client(req: ClientPerfRequest):
 
 @router.get("/perf/summary")
 async def perf_summary(hours: float = Query(24.0)):
-    """Rolled-up perf view for the cron watchdog (and for manual eyeballing):
-    backend turn latency (total + time-to-first-token) from perf/turns.jsonl,
-    and frontend typing-latency beacons from perf/client.jsonl. Windowed by
-    `hours` so a stale spike from days ago doesn't skew the current read."""
+    """Rolled-up perf view for the cron watchdog (and for manual eyeballing).
+
+    Backend turn latency (perf/turns.jsonl) is INFORMATIONAL ONLY -- it swings
+    with whatever the agent is doing that turn (a browser task and a one-line
+    reply are not comparable), so it is not a UI regression signal and the
+    watchdog does not gate on it. The three frontend beacons (keystroke,
+    longtask, session_switch -- perf/client.jsonl) are the actual "does the
+    UI feel slow" signal and drive the watchdog's thresholds.
+
+    Windowed by `hours` so a stale spike from days ago doesn't skew the read.
+    """
     since = time.time() - max(hours, 0.01) * 3600.0
     turns = _perf_read("turns.jsonl", since_s=since)
     client = _perf_read("client.jsonl", since_s=since)
     total_ms = [t["total_ms"] for t in turns if isinstance(t.get("total_ms"), (int, float))]
     first_delta_ms = [t["first_delta_ms"] for t in turns if isinstance(t.get("first_delta_ms"), (int, float))]
     failures = [t for t in turns if not t.get("ok", True)]
-    keystroke_p95 = [c["p95_ms"] for c in client if c.get("event") == "keystroke" and c.get("p95_ms")]
+
+    def client_stats(event: str) -> dict[str, Any]:
+        vals = [c["p95_ms"] for c in client if c.get("event") == event and c.get("p95_ms")]
+        return _perf_stats(vals)
+
     return {
         "window_hours": hours,
         "turn_count": len(turns),
-        "turn_total_ms": _perf_stats(total_ms),
-        "turn_first_delta_ms": _perf_stats(first_delta_ms),
+        "turn_total_ms_informational": _perf_stats(total_ms),
+        "turn_first_delta_ms_informational": _perf_stats(first_delta_ms),
         "failure_count": len(failures),
-        "client_keystroke_p95_ms": _perf_stats(keystroke_p95),
+        "client_keystroke_p95_ms": client_stats("keystroke"),
+        "client_longtask_p95_ms": client_stats("longtask"),
+        "client_session_switch_p95_ms": client_stats("session_switch"),
         "sample_failures": [
             {"session_id": t.get("session_id"), "total_ms": t.get("total_ms")}
             for t in failures[-5:]
