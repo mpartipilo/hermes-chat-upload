@@ -118,6 +118,7 @@ button{touch-action:manipulation;font-family:inherit}
 .wc-del:hover{color:var(--wc-danger)}
 .wc-needs-answer{border-color:var(--wc-accent-strong,#e0a52c)!important;box-shadow:inset 3px 0 0 var(--wc-accent-strong,#e0a52c)}
 .wc-badge-clarify{color:#1a1200;background:var(--wc-accent-strong,#e0a52c);border-color:var(--wc-accent-strong,#e0a52c);animation:wc-pulse 2s ease-in-out infinite}
+.wc-badge-busy{color:var(--wc-accent-ink);background:var(--wc-accent);border-color:var(--wc-accent);animation:wc-pulse 2s ease-in-out infinite}
 @keyframes wc-pulse{0%,100%{opacity:1}50%{opacity:.55}}
 .wc-sheet-new{border-top:1px solid var(--wc-border);padding:8px 12px}
 .wc-sheet-new button{width:100%;padding:11px;border-radius:6px;font-size:15px;font-weight:600;border:1px solid var(--wc-accent);background:transparent;color:var(--wc-accent);cursor:pointer}
@@ -464,6 +465,14 @@ function ChatPage() {
   // One WebSocket per session id, so a background session's stream keeps
   // running (and can be individually stopped) while another is viewed.
   var wsMapRef = useRef({});
+  // Polling handle per session id for a turn that's busy on the SERVER but
+  // not owned by this tab's own WebSocket (started from another tab/device,
+  // or survives this tab's own page reload -- busyMap always starts empty
+  // client-side, so without this a refreshed page has no way to know the
+  // agent is still working and would let you fire a second message that
+  // silently queues behind the per-session lock instead of interrupting
+  // anything, looking hung with zero feedback).
+  var remoteBusyPollRef = useRef({});
   var pendingScrollRef = useRef(false);
   // Tracks "was the user at the bottom" from the LAST real scroll event, not
   // recomputed after new content already grew the DOM -- see the fix note
@@ -527,6 +536,14 @@ function ChatPage() {
       setMessages(d.messages || d.history || []); setAttachments([]);
       perfDone();
       checkPendingClarify(id);
+      // Server-side truth for "is this session's turn actually in flight" --
+      // this tab's own busyMap always starts empty on load/refresh, so
+      // without this a still-running turn (started here before a reload, or
+      // from another tab/device) would look idle: sending into it wouldn't
+      // interrupt anything, it would silently queue behind the per-session
+      // lock until the real turn finishes. wsMapRef check avoids double-
+      // tracking a turn this very tab's live WS already owns.
+      if (d.is_busy && !wsMapRef.current[id]) watchRemoteBusy(id);
       // Model is now a server-side per-session property (state.db `model`
       // column). Prefer the persisted value; fall back to the dashboard's
       // current main model via the `|| defaultModel` in the picker/send.
@@ -554,6 +571,25 @@ function ChatPage() {
   function sessionPrefs(id) {
     var key = "web-chat.prefs." + id;
     try { return JSON.parse(localStorage.getItem(key) || "{}"); } catch (e) { return {}; }
+  }
+  // Watch a session the SERVER says is busy but this tab's own WebSocket
+  // doesn't own (see remoteBusyPollRef comment) -- poll until it finishes,
+  // then refresh the final messages once so the completed turn appears
+  // without a manual reload.
+  function watchRemoteBusy(id) {
+    if (remoteBusyPollRef.current[id]) return;
+    setBusyFor(id, true);
+    setStatusFor(id, "thinking");
+    var tick = function () {
+      afetch(withProfile(api("/sessions/" + encodeURIComponent(id)))).then(r => r.ok ? r.json() : Promise.reject()).then(d => {
+        if (d.is_busy) return;
+        clearInterval(remoteBusyPollRef.current[id]);
+        delete remoteBusyPollRef.current[id];
+        setBusyFor(id, false); setStatusFor(id, null);
+        if (id === sessionIdRef.current) setMessages(d.messages || d.history || []);
+      }).catch(() => { });
+    };
+    remoteBusyPollRef.current[id] = setInterval(tick, 2500);
   }
   function setSessionPref(id, patch) {
     var key = "web-chat.prefs." + id;
@@ -655,6 +691,13 @@ function ChatPage() {
       clearInterval(t);
     };
   }, [busy, sessionId, profile]);
+  // Unmount-only cleanup for remote-busy polls (see watchRemoteBusy) -- these
+  // are keyed per session id and must survive session switches (that's the
+  // whole point, e.g. a sidebar "busy" badge for a chat you're not viewing),
+  // so they can't live in the effect above whose deps change on every switch.
+  useEffect(() => {
+    return () => { Object.keys(remoteBusyPollRef.current).forEach(id => clearInterval(remoteBusyPollRef.current[id])); };
+  }, []);
   // Poll for pending clarify cards across ALL sessions, unconditionally --
   // deliberately NOT gated by document.hidden like the main sync poll, so a
   // question raised while this tab is backgrounded still gets badged the
@@ -842,12 +885,14 @@ function ChatPage() {
     var pendingSet = new Set(pendingClarifySessions);
     return sessions.map(s => {
       var needsAnswer = pendingSet.has(s.session_id);
-      return React.createElement("div", { key: s.session_id, className: "wc-session" + (s.session_id === sessionId ? " active" : "") + (needsAnswer ? " wc-needs-answer" : ""), onClick: () => { loadSession(s.session_id); setSessionsOpen(false); } },
+      return React.createElement("div", { key: s.session_id, className: "wc-session" + (s.session_id === sessionId ? " active" : "") + (needsAnswer ? " wc-needs-answer" : "") + (s.is_busy ? " wc-busy" : ""), onClick: () => { loadSession(s.session_id); setSessionsOpen(false); } },
         React.createElement("button", { className: "wc-del", onClick: (e) => { e.stopPropagation(); setConfirmDel(s.session_id); }, title: "Delete" }, "×"),
         React.createElement("div", { className: "wc-session-body" },
           React.createElement("div", { className: "wc-session-title" }, s.title || "New chat"),
           React.createElement("div", { className: "wc-session-prev" }, s.preview || "No messages")),
-        needsAnswer ? React.createElement("span", { className: "wc-badge wc-badge-clarify", title: "Waiting on your answer" }, "❓ needs answer") : (sourceLabel(s.source) ? React.createElement("span", { className: "wc-badge" }, sourceLabel(s.source)) : null));
+        needsAnswer ? React.createElement("span", { className: "wc-badge wc-badge-clarify", title: "Waiting on your answer" }, "❓ needs answer")
+          : s.is_busy ? React.createElement("span", { className: "wc-badge wc-badge-busy", title: "Agent is working" }, "\u23f3 busy")
+          : (sourceLabel(s.source) ? React.createElement("span", { className: "wc-badge" }, sourceLabel(s.source)) : null));
     });
   }, [sessions, sessionId, pendingClarifySessions]);
   var settingsPanel = React.createElement("div", { className: "wc-settings" },

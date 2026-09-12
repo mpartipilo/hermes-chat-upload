@@ -236,3 +236,35 @@ def test_perf_summary_marks_backend_turn_stats_informational(api, client):
     # name would silently treat backend noise as a UI regression signal.
     assert "turn_total_ms" not in body
     assert "turn_first_delta_ms" not in body
+
+
+def test_session_busy_tracks_ws_registration(api):
+    """_session_busy reflects _register_ws/_unregister_ws exactly -- this is
+    the server-side truth the frontend polls via GET /sessions/{id} (and the
+    /sessions list) so a freshly-loaded/refreshed page can tell a session's
+    turn is still genuinely in flight instead of assuming idle (see
+    watchRemoteBusy in index.jsx)."""
+    sid = "busy-test-session"
+    fake_ws = object()
+    assert api._session_busy(sid) is False
+    api._register_ws(sid, fake_ws)
+    assert api._session_busy(sid) is True
+    # A different session id must not be affected.
+    assert api._session_busy("other-session") is False
+    api._unregister_ws(sid, fake_ws)
+    assert api._session_busy(sid) is False
+
+
+def test_session_busy_unregister_ignores_stale_ws(api):
+    """Unregistering with a WS object that no longer owns the session (e.g. a
+    stale reference from a superseded stream) must not clear the CURRENT
+    owner's busy flag -- otherwise a fast reconnect could get its busy status
+    wiped out from under it by the old connection's teardown."""
+    sid = "busy-test-session-2"
+    ws_old, ws_new = object(), object()
+    api._register_ws(sid, ws_old)
+    api._register_ws(sid, ws_new)
+    api._unregister_ws(sid, ws_old)
+    assert api._session_busy(sid) is True
+    api._unregister_ws(sid, ws_new)
+    assert api._session_busy(sid) is False

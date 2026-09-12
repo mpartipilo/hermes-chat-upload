@@ -344,8 +344,9 @@ def _list_sessions(profile: Optional[str] = None) -> list[dict[str, Any]]:
             exclude_sources=_AUTOMATION_SESSION_SOURCES)
         out = []
         for s in rows:
+            sid = s.get("id") or s.get("session_id")
             out.append({
-                "session_id": s.get("id") or s.get("session_id"),
+                "session_id": sid,
                 "title": s.get("title") or s.get("display_title") or "New chat",
                 "preview": (s.get("preview") or "")[:120],
                 "created_at": s.get("created_at"),
@@ -353,6 +354,7 @@ def _list_sessions(profile: Optional[str] = None) -> list[dict[str, Any]]:
                 "message_count": s.get("message_count") or 0,
                 "source": s.get("source") or "",
                 "model": s.get("model") or "",
+                "is_busy": _session_busy(sid) if sid else False,
             })
         return out
     finally:
@@ -462,6 +464,22 @@ def _unregister_ws(session_id: str, ws: WebSocket) -> None:
     with _CLARIFY_WS_LOCK:
         if _ws_by_session.get(session_id) is ws:
             _ws_by_session.pop(session_id, None)
+
+
+def _session_busy(session_id: str) -> bool:
+    """True while a /stream WS owns this session's in-flight agent turn.
+
+    Registered in _register_ws right after the WS handshake (before the
+    per-session lock is acquired) and cleared in _unregister_ws after the
+    turn's done/clear frames are sent -- so this spans exactly the window a
+    client should treat the session as busy, regardless of which browser
+    tab/device/reload initiated it. Lets a freshly-loaded or refreshed page
+    (whose busyMap always starts empty client-side) recover the true state
+    instead of silently queuing a second turn behind the per-session lock --
+    a send while genuinely busy does NOT interrupt the active turn, it queues
+    invisibly until the lock frees, which looks hung with no feedback."""
+    with _CLARIFY_WS_LOCK:
+        return session_id in _ws_by_session
 
 
 def _agent_history_from_chat_upload(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -650,7 +668,7 @@ async def sessions_get(session_id: str, profile: Optional[str] = Query(None)):
             model = (s or {}).get("model") or ""
     finally:
         db.close()
-    return {"session_id": session_id, "messages": messages, "history": messages, "model": model}
+    return {"session_id": session_id, "messages": messages, "history": messages, "model": model, "is_busy": _session_busy(session_id)}
 
 @router.put("/sessions/{session_id}")
 async def sessions_put(session_id: str, req: SessionSaveRequest):
