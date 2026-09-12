@@ -494,6 +494,18 @@ function ChatPage() {
   useEffect(() => { messagesRef.current = messages; }, [messages]);
   var sessionIdRef = useRef(sessionId);
   useEffect(() => { sessionIdRef.current = sessionId; }, [sessionId]);
+  // input/attachments/busyMap change on every keystroke/upload -- `send` must
+  // NOT depend on them directly, or its identity churns every keystroke,
+  // which busts React.memo on every Bubble row via the onSaveEdit prop (same
+  // bug class as the editValue-prop regression fixed earlier, just
+  // reintroduced by the rewind/edit feature's `send` dependency array this
+  // time). Refs let send() read current values without being recreated.
+  var inputRef2 = useRef(input);
+  useEffect(() => { inputRef2.current = input; }, [input]);
+  var attachmentsRef = useRef(attachments);
+  useEffect(() => { attachmentsRef.current = attachments; }, [attachments]);
+  var busyMapRef = useRef(busyMap);
+  useEffect(() => { busyMapRef.current = busyMap; }, [busyMap]);
 
   function loadSessions() { afetch(withProfile(api("/sessions"))).then(r => r.json()).then(d => setSessions(d.sessions || [])).catch(() => { }); }
   // Recovery: a page reload or a WS that died mid-turn loses the browser-side
@@ -749,24 +761,25 @@ function ChatPage() {
   // corrupts this stream: each session has its own busy flag, status,
   // clarify card, streaming buffer, and WebSocket entry.
   var send = useCallback(function (textOverride, baseMessagesOverride, sidOverride) {
-    var sid = sidOverride || sessionId;
-    var text = (textOverride !== undefined ? textOverride : input).trim();
-    if ((!text && !attachments.length) || busyMap[sid]) return;
-    var base = baseMessagesOverride !== undefined ? baseMessagesOverride : (sid === sessionId ? messages : []);
+    var sid = sidOverride || sessionIdRef.current;
+    var text = (textOverride !== undefined ? textOverride : inputRef2.current).trim();
+    var currentAttachments = attachmentsRef.current;
+    if ((!text && !currentAttachments.length) || busyMapRef.current[sid]) return;
+    var base = baseMessagesOverride !== undefined ? baseMessagesOverride : (sid === sessionIdRef.current ? messagesRef.current : []);
     var streamSid = sid;
-    var mediaText = attachments.map(a => "MEDIA:" + a.path).join("\n");
+    var mediaText = currentAttachments.map(a => "MEDIA:" + a.path).join("\n");
     var full = [text, mediaText].filter(Boolean).join("\n");
-    var userMsg = { role: "user", text: full, timestamp: Date.now() / 1000, attachments: attachments };
+    var userMsg = { role: "user", text: full, timestamp: Date.now() / 1000, attachments: currentAttachments };
     var next = base.concat([userMsg]);
-    if (sid === sessionId) { pendingScrollRef.current = true; setMessages(next); }
+    if (sid === sessionIdRef.current) { pendingScrollRef.current = true; setMessages(next); }
     saveLocal(sid, next);
-    if (sid === sessionId) { setInput(""); setAttachments([]); }
+    if (sid === sessionIdRef.current) { setInput(""); setAttachments([]); }
     setBusyFor(sid, true); setStatusFor(sid, "thinking"); setError(null); setClarifyFor(sid, null);
     streamingMapRef.current[sid] = "";
     var chunks = [];
     var ws = new WebSocket(wsUrl("/stream"));
     wsMapRef.current[sid] = ws;
-    ws.onopen = function () { ws.send(JSON.stringify({ type: "message", text: full, session_id: sid, profile: profile, model: sessionModel[sid] || defaultModel, effort: sessionEffort[sid] || "", attachments: attachments })); };
+    ws.onopen = function () { ws.send(JSON.stringify({ type: "message", text: full, session_id: sid, profile: profile, model: sessionModel[sid] || defaultModel, effort: sessionEffort[sid] || "", attachments: currentAttachments })); };
     ws.onmessage = function (evt) {
       var f; try { f = JSON.parse(evt.data); } catch (e) { return; }
       if (f.type === "session" && f.session_id) {
@@ -808,7 +821,7 @@ function ChatPage() {
     };
     ws.onerror = function () { if (sessionIdRef.current === streamSid) setError("Connection error. Restart dashboard and retry if the plugin was just updated."); setBusyFor(streamSid, false); setStatusFor(streamSid, null); };
     ws.onclose = function () { if (wsMapRef.current[streamSid] === ws) delete wsMapRef.current[streamSid]; setBusyFor(streamSid, false); setStatusFor(streamSid, null); };
-  }, [input, attachments, busyMap, messages, sessionId, profile, sessionModel, sessionEffort]);
+  }, [profile, sessionModel, sessionEffort]);
   function key(e) {
     if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(); return; }
     // Skip pure navigation/modifier keys -- they don't trigger the
