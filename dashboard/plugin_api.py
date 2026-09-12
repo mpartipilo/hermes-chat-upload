@@ -60,7 +60,12 @@ _pending_clarify: dict[str, dict[str, Any]] = {}
 # Mirrors web/src/pages/SessionsPage.tsx AUTOMATION_SESSION_SOURCES so the
 # web-chat session list matches the dashboard's default "Chats" filter.
 _AUTOMATION_SESSION_SOURCES = ["cron", "tool", "api_server", "acp", "hermes_flow", "vulcan_delegate", "webhook"]
-_CLARIFY_TIMEOUT = float(os.getenv("HERMES_CHAT_CLARIFY_TIMEOUT", "300"))
+# Default raised from 300s (5min) -> 3600s (1hr): the old timeout silently
+# expired clarify cards the user hadn'''t seen yet (backgrounded tab, mobile
+# tab suspension, or simply not looking at that chat) -- the agent then
+# barreled ahead and reported "No response came through" with no visible
+# prompt ever having been shown. See hermes-chat-frontend skill incident log.
+_CLARIFY_TIMEOUT = float(os.getenv("HERMES_CHAT_CLARIFY_TIMEOUT", "3600"))
 _CLARIFY_WS_LOCK = threading.Lock()
 
 _TOOL_STATUS_MAP = {
@@ -112,11 +117,92 @@ class RewindRequest(BaseModel):
     message_id: int
 
 
+class ClientPerfRequest(BaseModel):
+    # Frontend keystroke-to-paint samples, aggregated client-side before
+    # sending (never one beacon per keystroke -- see PERF.md). p50/p95 are in
+    # milliseconds; count is how many raw samples were folded into this batch.
+    event: str = "keystroke"
+    p50_ms: float = 0.0
+    p95_ms: float = 0.0
+    max_ms: float = 0.0
+    count: int = 0
+    message_count: int = 0
+
+
 def _root() -> Path:
     return Path(get_hermes_home()).expanduser() / "plugins" / "web-chat"
 
 def _uploads_root() -> Path:
     p = _root() / "uploads"; p.mkdir(parents=True, exist_ok=True); return p
+
+def _perf_root() -> Path:
+    p = _root() / "perf"; p.mkdir(parents=True, exist_ok=True); return p
+
+_PERF_MAX_LINES = int(os.getenv("HERMES_CHAT_PERF_MAX_LINES", "5000"))
+_PERF_LOCK = threading.Lock()
+
+def _perf_append(filename: str, record: dict[str, Any]) -> None:
+    """Append one JSONL record, trimming to the last _PERF_MAX_LINES lines so
+    the log never grows unbounded. Best-effort: perf logging must never break
+    a chat turn, so every failure is swallowed."""
+    try:
+        path = _perf_root() / filename
+        record = dict(record); record["ts"] = record.get("ts", time.time())
+        with _PERF_LOCK:
+            with path.open("a") as f:
+                f.write(json.dumps(record) + "\n")
+            # Cheap trim: only rewrite when meaningfully over budget, so a
+            # normal append stays O(1) and we don't stat+rewrite every call.
+            try:
+                with path.open("r") as f:
+                    lines = f.readlines()
+                if len(lines) > _PERF_MAX_LINES * 1.2:
+                    with path.open("w") as f:
+                        f.writelines(lines[-_PERF_MAX_LINES:])
+            except Exception:
+                pass
+    except Exception:
+        log.debug("web-chat: perf log write failed", exc_info=True)
+
+def _perf_read(filename: str, since_s: float = 0.0) -> list[dict[str, Any]]:
+    path = _perf_root() / filename
+    if not path.exists():
+        return []
+    out: list[dict[str, Any]] = []
+    try:
+        with path.open("r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if since_s and rec.get("ts", 0) < since_s:
+                    continue
+                out.append(rec)
+    except Exception:
+        log.debug("web-chat: perf log read failed", exc_info=True)
+    return out
+
+def _percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    s = sorted(values)
+    k = (len(s) - 1) * (pct / 100.0)
+    f, c = int(k), min(int(k) + 1, len(s) - 1)
+    if f == c:
+        return s[f]
+    return s[f] + (s[c] - s[f]) * (k - f)
+
+def _perf_stats(values: list[float]) -> dict[str, Any]:
+    return {
+        "count": len(values),
+        "p50_ms": round(_percentile(values, 50), 1),
+        "p95_ms": round(_percentile(values, 95), 1),
+        "max_ms": round(max(values), 1) if values else 0.0,
+    }
 
 def _valid_session_id(session_id: str) -> bool:
     return bool(session_id and _SESSION_RE.match(session_id) and ".." not in session_id and "/" not in session_id and "\\" not in session_id)
@@ -634,6 +720,45 @@ async def sessions_rewind(session_id: str, req: RewindRequest, profile: Optional
     return {"ok": True, "session_id": session_id, "rewound_count": result.get("rewound_count", 0)}
 
 
+@router.post("/perf/client")
+async def perf_client(req: ClientPerfRequest):
+    """Frontend perf beacon: pre-aggregated (client-side) typing-latency stats,
+    NOT one call per keystroke -- see PERF_PROFILER.md. Folded into
+    perf/client.jsonl alongside perf/turns.jsonl (backend turn timing)."""
+    _perf_append("client.jsonl", {
+        "event": req.event, "p50_ms": req.p50_ms, "p95_ms": req.p95_ms,
+        "max_ms": req.max_ms, "count": req.count, "message_count": req.message_count,
+    })
+    return {"ok": True}
+
+
+@router.get("/perf/summary")
+async def perf_summary(hours: float = Query(24.0)):
+    """Rolled-up perf view for the cron watchdog (and for manual eyeballing):
+    backend turn latency (total + time-to-first-token) from perf/turns.jsonl,
+    and frontend typing-latency beacons from perf/client.jsonl. Windowed by
+    `hours` so a stale spike from days ago doesn't skew the current read."""
+    since = time.time() - max(hours, 0.01) * 3600.0
+    turns = _perf_read("turns.jsonl", since_s=since)
+    client = _perf_read("client.jsonl", since_s=since)
+    total_ms = [t["total_ms"] for t in turns if isinstance(t.get("total_ms"), (int, float))]
+    first_delta_ms = [t["first_delta_ms"] for t in turns if isinstance(t.get("first_delta_ms"), (int, float))]
+    failures = [t for t in turns if not t.get("ok", True)]
+    keystroke_p95 = [c["p95_ms"] for c in client if c.get("event") == "keystroke" and c.get("p95_ms")]
+    return {
+        "window_hours": hours,
+        "turn_count": len(turns),
+        "turn_total_ms": _perf_stats(total_ms),
+        "turn_first_delta_ms": _perf_stats(first_delta_ms),
+        "failure_count": len(failures),
+        "client_keystroke_p95_ms": _perf_stats(keystroke_p95),
+        "sample_failures": [
+            {"session_id": t.get("session_id"), "total_ms": t.get("total_ms")}
+            for t in failures[-5:]
+        ],
+    }
+
+
 @router.delete("/sessions/{session_id}")
 async def sessions_delete(session_id: str, profile: Optional[str] = Query(None)):
     if not _valid_session_id(session_id): raise HTTPException(status_code=400, detail="invalid session_id")
@@ -665,6 +790,18 @@ async def upload(file: UploadFile = File(...), session_id: str = Form(...)):
     if dest.suffix.lower() in _EXECUTABLE_EXTS:
         warning = "Potentially executable file uploaded; inspect before running."
     return {"ok": True, "session_id": sid, "filename": dest.name, "original_filename": file.filename, "path": str(dest), "url": f"/api/plugins/web-chat/file?path={dest}", "type": typ, "content_type": file.content_type, "size": len(raw), "warning": warning}
+
+@router.get("/pending_clarify_sessions")
+async def pending_clarify_sessions():
+    """All session_ids across every profile with an unanswered clarify card right
+    now -- powers the sidebar badge so a pending question in a BACKGROUND chat is
+    visible without having to open that chat (see pending_clarify below, which is
+    the single-session recovery poll this complements)."""
+    return {"session_ids": sorted({
+        p["session_id"] for p in _pending_clarify.values()
+        if p.get("payload") and not p["done"].is_set()
+    })}
+
 
 @router.get("/pending_clarify")
 async def pending_clarify(session_id: str):
@@ -786,14 +923,24 @@ async def stream_ws(ws: WebSocket) -> None:
     await ws.send_text(json.dumps({"type": "session", "session_id": session_id}))
     await ws.send_text(json.dumps({"type": "status", "label": "thinking"}))
     q: asyncio.Queue = asyncio.Queue(); result_holder: list[str] = []; error_holder: list[str] = []
+    # Perf instrumentation: wall-clock markers for this turn, written to
+    # perf/turns.jsonl on completion (see PERF_PROFILER.md). first_delta_at is
+    # the biggest lever for "feels laggy" complaints -- everything before it
+    # is dead air with no visible progress in the UI.
+    _turn_t0 = time.monotonic()
+    _first_delta_at: list[float] = []
+    _tool_calls: list[str] = []
     def _push(frame: dict[str, Any]):
         fut = asyncio.run_coroutine_threadsafe(q.put(frame), loop)
         fut.result(timeout=1)
     def _on_tool_start(tool_call_id: str, name: str, args: dict):
-        if tool_call_id and not name.startswith("_"): _push({"type": "status", "label": _tool_label(name)})
+        if tool_call_id and not name.startswith("_"):
+            _tool_calls.append(name)
+            _push({"type": "status", "label": _tool_label(name)})
     def _on_tool_complete(tool_call_id: str, name: str, args: dict, result):
         if tool_call_id and not name.startswith("_"): _push({"type": "status", "label": "thinking"})
     def _on_delta(delta: str):
+        if not _first_delta_at: _first_delta_at.append(time.monotonic())
         _push({"type": "status", "label": "responding"}); _push({"type": "delta", "text": delta})
     def _on_clarify(question: str, choices=None, multi_select: bool = False, questions=None) -> str:
         # Runs on the agent thread; blocks until the browser answers the card
@@ -879,6 +1026,20 @@ async def stream_ws(ws: WebSocket) -> None:
         except WebSocketDisconnect:
             return
         thread.join(timeout=5)
+        _turn_total_ms = (time.monotonic() - _turn_t0) * 1000.0
+        _first_delta_ms = ((_first_delta_at[0] - _turn_t0) * 1000.0) if _first_delta_at else None
+        _perf_append("turns.jsonl", {
+            "session_id": session_id,
+            "profile": profile or "default",
+            "model": model or "",
+            "ok": not bool(error_holder),
+            "total_ms": round(_turn_total_ms, 1),
+            "first_delta_ms": round(_first_delta_ms, 1) if _first_delta_ms is not None else None,
+            "tool_calls": len(_tool_calls),
+            "tool_names": _tool_calls[:10],
+            "input_chars": len(user_text),
+            "output_chars": len("".join(full_parts)) if full_parts else 0,
+        })
         if error_holder:
             await ws.send_text(json.dumps({"type": "error", "text": error_holder[0]}))
         else:

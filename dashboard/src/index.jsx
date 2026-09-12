@@ -4,7 +4,7 @@ import DOMPurify from "dompurify";
 var SDK = window.__HERMES_PLUGIN_SDK__ || {};
 var React = SDK.React || window.React;
 var hooks = SDK.hooks || React;
-var useState = hooks.useState, useEffect = hooks.useEffect, useRef = hooks.useRef, useCallback = hooks.useCallback;
+var useState = hooks.useState, useEffect = hooks.useEffect, useRef = hooks.useRef, useCallback = hooks.useCallback, useMemo = hooks.useMemo || React.useMemo;
 var PLUGIN_VERSION = "1.0.0";
 
 function afetch(url, init) {
@@ -27,6 +27,14 @@ marked.setOptions({ gfm: true, breaks: false, renderer: (() => {
   return r;
 })() });
 function sanitizeMarkdownHtml(html) { return DOMPurify.sanitize(html, { ADD_ATTR: ["target", "rel"] }); }
+var _mdCache = new Map();
+function renderMarkdownCached(text) {
+  if (_mdCache.has(text)) return _mdCache.get(text);
+  var html = sanitizeMarkdownHtml(marked.parse(text || ""));
+  if (_mdCache.size > 400) _mdCache.delete(_mdCache.keys().next().value);
+  _mdCache.set(text, html);
+  return html;
+}
 
 const CSS = `
 *{-webkit-tap-highlight-color:transparent;box-sizing:border-box}
@@ -108,6 +116,9 @@ button{touch-action:manipulation;font-family:inherit}
 .wc-badge{flex-shrink:0;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--wc-muted);border:1px solid var(--wc-border);border-radius:4px;padding:1px 5px}
 .wc-del{position:absolute;top:6px;right:6px;border:0;background:transparent;color:var(--wc-muted);cursor:pointer;font-size:15px;opacity:.6;padding:3px 6px}
 .wc-del:hover{color:var(--wc-danger)}
+.wc-needs-answer{border-color:var(--wc-accent-strong,#e0a52c)!important;box-shadow:inset 3px 0 0 var(--wc-accent-strong,#e0a52c)}
+.wc-badge-clarify{color:#1a1200;background:var(--wc-accent-strong,#e0a52c);border-color:var(--wc-accent-strong,#e0a52c);animation:wc-pulse 2s ease-in-out infinite}
+@keyframes wc-pulse{0%,100%{opacity:1}50%{opacity:.55}}
 .wc-sheet-new{border-top:1px solid var(--wc-border);padding:8px 12px}
 .wc-sheet-new button{width:100%;padding:11px;border-radius:6px;font-size:15px;font-weight:600;border:1px solid var(--wc-accent);background:transparent;color:var(--wc-accent);cursor:pointer}
 .wc-confirm{position:fixed;inset:0;z-index:80;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.55);padding:16px}
@@ -177,6 +188,54 @@ function sourceLabel(src) {
   return s.split("_").filter(Boolean).map(function (p) { return p.charAt(0).toUpperCase() + p.slice(1); }).join(" ").slice(0, 14);
 }
 function uuid() { return (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random()).replace(/[^A-Za-z0-9_.-]/g, "-"); }
+
+// --- Perf tracker -----------------------------------------------------
+// Measures keystroke-to-paint latency (keydown -> next animation frame),
+// which is the "typing feels laggy" complaint made concrete: it captures
+// exactly the render+reflow cost triggered by that keystroke, including
+// markdown re-parsing of unrelated messages if memoization regresses.
+// Samples are batched client-side (NEVER one network call per keystroke --
+// that would itself be the perf bug) and flushed periodically as a single
+// p50/p95/max beacon to /perf/client for the cron watchdog to trend.
+var PerfTracker = (function () {
+  var samples = [];
+  var flushTimer = null;
+  var FLUSH_MS = 20000, MAX_BUFFERED = 200;
+  function percentile(arr, p) {
+    if (!arr.length) return 0;
+    var s = arr.slice().sort(function (a, b) { return a - b; });
+    var idx = Math.min(s.length - 1, Math.floor((s.length - 1) * p));
+    return s[idx];
+  }
+  function flush(messageCount) {
+    if (!samples.length) return;
+    var batch = samples; samples = [];
+    var payload = {
+      event: "keystroke",
+      p50_ms: Math.round(percentile(batch, 0.5) * 10) / 10,
+      p95_ms: Math.round(percentile(batch, 0.95) * 10) / 10,
+      max_ms: Math.round(Math.max.apply(null, batch) * 10) / 10,
+      count: batch.length,
+      message_count: messageCount || 0,
+    };
+    try {
+      afetch(api("/perf/client"), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }).catch(function () { });
+    } catch (e) { /* perf reporting must never break typing */ }
+  }
+  return {
+    markKeydown: function (messageCount) {
+      var t0 = performance.now();
+      requestAnimationFrame(function () {
+        requestAnimationFrame(function () {
+          samples.push(performance.now() - t0);
+          if (samples.length > MAX_BUFFERED) samples.shift();
+          if (!flushTimer) flushTimer = setTimeout(function () { flushTimer = null; flush(messageCount); }, FLUSH_MS);
+        });
+      });
+    },
+    flushNow: flush,
+  };
+})();
 function stripRec(s) { return String(s || "").replace(/\s*\(Recommended\)\s*$/i, ""); }
 function isRec(s) { return /\(Recommended\)\s*$/i.test(String(s || "")); }
 
@@ -199,25 +258,25 @@ function FileChip({ path, onRemove }) {
   var name = String(path).split("/").pop() || path;
   return React.createElement("a", { className: "wc-chip", href: fileHref(path, false), title: path, onClick: onRemove ? function (e) { e.preventDefault(); onRemove(); } : undefined }, "📎 ", name, onRemove ? " ×" : "");
 }
-function AgentContent({ text }) {
-  var segs = parseSegments(text || "");
-  var files = segs.filter(s => s.type === "file").map(s => s.path);
+var AgentContent = React.memo(function AgentContent({ text }) {
+  var segs = useMemo(function () { return parseSegments(text || ""); }, [text]);
+  var files = useMemo(function () { return segs.filter(s => s.type === "file").map(s => s.path); }, [segs]);
   return React.createElement(React.Fragment, null,
     files.length >= 3 ? React.createElement("a", { className: "wc-bulk", href: api("/bulk-download"), onClick: function (e) { e.preventDefault(); afetch(api("/bulk-download"), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ paths: files }) }).then(r => r.blob()).then(b => { var u = URL.createObjectURL(b), a = document.createElement("a"); a.href = u; a.download = "web-chat-files.zip"; a.click(); URL.revokeObjectURL(u); }); } }, "Download all (ZIP)") : null,
     segs.map((s, i) => {
       if (s.type === "file") return React.createElement(FileChip, { key: i, path: s.path });
       if (s.type === "image") return React.createElement("img", { key: i, className: "wc-img", src: s.url, alt: s.alt });
-      var html = sanitizeMarkdownHtml(marked.parse(s.content || ""));
+      var html = renderMarkdownCached(s.content || "");
       return React.createElement("div", { key: i, className: "wc-md", dangerouslySetInnerHTML: { __html: html } });
     }));
-}
+});
 function StatusLine({ label }) {
   if (!label) return null;
   return React.createElement("div", { className: "wc-status" },
     React.createElement("span", { className: "wc-dots" }, React.createElement("span"), React.createElement("span"), React.createElement("span")),
     React.createElement("span", null, label + "…"));
 }
-function Bubble({ msg, idx, canEdit, editing, editValue, onEditChange, onStartEdit, onSaveEdit, onCancelEdit }) {
+var Bubble = React.memo(function Bubble({ msg, idx, canEdit, editing, editValue, onEditChange, onStartEdit, onSaveEdit, onCancelEdit }) {
   var role = msg.role || "assistant";
   var text = msg.text || msg.content || "";
   if (role === "assistant") {
@@ -243,7 +302,7 @@ function Bubble({ msg, idx, canEdit, editing, editValue, onEditChange, onStartEd
   return React.createElement("div", { className: "wc-row user" },
     React.createElement("div", { className: "wc-bubble" }, text,
       canEdit ? React.createElement("button", { className: "wc-edit-trigger", title: "Edit & resend", onClick: () => onStartEdit(idx) }, "\u270E") : null));
-}
+});
 function ClarifyCard({ frame, onAnswer }) {
   var [answers, setAnswers] = useState({});
   var [others, setOthers] = useState({});
@@ -330,6 +389,12 @@ function ChatPage() {
   var [busyMap, setBusyMap] = useState({});
   var [statusMap, setStatusMap] = useState({});
   var [clarifyMap, setClarifyMap] = useState({});
+  // Session ids (any chat, not just the one currently open) with an
+  // unanswered clarify card -- powers the sidebar badge. Polled
+  // unconditionally (even while document.hidden) so a question raised in
+  // a background chat, or while the tab/phone is backgrounded, is still
+  // visible the next time the user glances at the sidebar.
+  var [pendingClarifySessions, setPendingClarifySessions] = useState([]);
   var busy = !!busyMap[sessionId];
   var status = statusMap[sessionId] || null;
   var clarify = clarifyMap[sessionId] || null;
@@ -522,6 +587,21 @@ function ChatPage() {
       clearInterval(t);
     };
   }, [busy, sessionId, profile]);
+  // Poll for pending clarify cards across ALL sessions, unconditionally --
+  // deliberately NOT gated by document.hidden like the main sync poll, so a
+  // question raised while this tab is backgrounded still gets badged the
+  // moment the user looks at the sidebar (see hermes-chat-frontend skill:
+  // clarify cards were expiring/going unseen with zero visible signal).
+  useEffect(() => {
+    function pollPendingClarify() {
+      afetch(withProfile(api("/pending_clarify_sessions"))).then(r => r.ok ? r.json() : null).then(d => {
+        if (d && d.session_ids) setPendingClarifySessions(d.session_ids);
+      }).catch(() => { });
+    }
+    pollPendingClarify();
+    var t = setInterval(pollPendingClarify, 10000);
+    return () => clearInterval(t);
+  }, [profile]);
   function onScroll() {
     var el = scrollRef.current;
     if (!el) return;
@@ -569,18 +649,18 @@ function ChatPage() {
   function answerClarify(requestId, qid, answer) {
     afetch(api("/clarify"), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ request_id: requestId, answer: answer, question_id: qid }) }).catch(() => { });
   }
-  function startEdit(idx) {
+  var startEdit = useCallback(function (idx) {
     if (busy) return;
-    var m = messages[idx];
+    var m = messagesRef.current[idx];
     if (!m) return;
     setEditingIdx(idx);
     setEditText(m.text || m.content || "");
-  }
-  function cancelEdit() { setEditingIdx(null); setEditText(""); }
-  function saveEdit(idx, msg, text) {
+  }, [busy]);
+  var cancelEdit = useCallback(function () { setEditingIdx(null); setEditText(""); }, []);
+  var saveEdit = useCallback(function (idx, msg, text) {
     text = String(text || "").trim();
     if (!text) { cancelEdit(); return; }
-    var truncated = messages.slice(0, idx);
+    var truncated = messagesRef.current.slice(0, idx);
     setEditingIdx(null); setEditText(""); setError(null);
     function proceed() { send(text, truncated); }
     if (msg.id != null) {
@@ -599,7 +679,7 @@ function ChatPage() {
       // loaded message) -- nothing to rewind server-side, just resend.
       proceed();
     }
-  }
+  }, [messagesRef, sessionId, send]);
   function stop() {
     afetch(api("/stop"), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: sessionId }) }).catch(() => { });
     var ws = wsMapRef.current[sessionId];
@@ -673,15 +753,34 @@ function ChatPage() {
     ws.onerror = function () { if (sessionIdRef.current === streamSid) setError("Connection error. Restart dashboard and retry if the plugin was just updated."); setBusyFor(streamSid, false); setStatusFor(streamSid, null); };
     ws.onclose = function () { if (wsMapRef.current[streamSid] === ws) delete wsMapRef.current[streamSid]; setBusyFor(streamSid, false); setStatusFor(streamSid, null); };
   }, [input, attachments, busyMap, messages, sessionId, profile, sessionModel, sessionEffort]);
-  function key(e) { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(); } }
+  function key(e) {
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(); return; }
+    // Skip pure navigation/modifier keys -- they don't trigger the
+    // input-state re-render this tracker is measuring.
+    if (e.key && e.key.length === 1 || e.key === "Backspace" || e.key === "Delete" || e.key === "Enter") {
+      PerfTracker.markKeydown(messages.length);
+    }
+  }
   var current = sessions.find(s => s.session_id === sessionId) || {};
-  var sessionList = sessions.length ? sessions.map(s => React.createElement("div", { key: s.session_id, className: "wc-session" + (s.session_id === sessionId ? " active" : ""), onClick: () => { loadSession(s.session_id); setSessionsOpen(false); } },
-      React.createElement("button", { className: "wc-del", onClick: (e) => { e.stopPropagation(); setConfirmDel(s.session_id); }, title: "Delete" }, "×"),
-      React.createElement("div", { className: "wc-session-body" },
-        React.createElement("div", { className: "wc-session-title" }, s.title || "New chat"),
-        React.createElement("div", { className: "wc-session-prev" }, s.preview || "No messages")),
-      sourceLabel(s.source) ? React.createElement("span", { className: "wc-badge" }, sourceLabel(s.source)) : null))
-      : React.createElement("div", { className: "wc-no-sessions" }, "No sessions yet — send a message to start.");
+  // Memoized: this only depends on sessions/sessionId/pendingClarifySessions,
+  // NOT on `input` -- without this it was rebuilt (with an O(sessions) indexOf
+  // scan x2 per row) on every keystroke re-render of ChatPage, which is what
+  // regressed client_keystroke_p95_ms after the clarify-badge feature landed
+  // (pendingClarifySessions was new and never wired into a useMemo, unlike
+  // AgentContent/Bubble in this same change). Use a Set for O(1) lookup too.
+  var sessionList = useMemo(function () {
+    if (!sessions.length) return React.createElement("div", { className: "wc-no-sessions" }, "No sessions yet — send a message to start.");
+    var pendingSet = new Set(pendingClarifySessions);
+    return sessions.map(s => {
+      var needsAnswer = pendingSet.has(s.session_id);
+      return React.createElement("div", { key: s.session_id, className: "wc-session" + (s.session_id === sessionId ? " active" : "") + (needsAnswer ? " wc-needs-answer" : ""), onClick: () => { loadSession(s.session_id); setSessionsOpen(false); } },
+        React.createElement("button", { className: "wc-del", onClick: (e) => { e.stopPropagation(); setConfirmDel(s.session_id); }, title: "Delete" }, "×"),
+        React.createElement("div", { className: "wc-session-body" },
+          React.createElement("div", { className: "wc-session-title" }, s.title || "New chat"),
+          React.createElement("div", { className: "wc-session-prev" }, s.preview || "No messages")),
+        needsAnswer ? React.createElement("span", { className: "wc-badge wc-badge-clarify", title: "Waiting on your answer" }, "❓ needs answer") : (sourceLabel(s.source) ? React.createElement("span", { className: "wc-badge" }, sourceLabel(s.source)) : null));
+    });
+  }, [sessions, sessionId, pendingClarifySessions]);
   var settingsPanel = React.createElement("div", { className: "wc-settings" },
     models.length ? React.createElement(React.Fragment, null,
       React.createElement("label", { className: "wc-settings-label" }, "Model"),
@@ -718,7 +817,7 @@ function ChatPage() {
         messages.length ? messages.map((m, i) => React.createElement(Bubble, {
           key: m.id != null ? "m" + m.id : i, msg: m, idx: i,
           canEdit: m.role === "user" && !busy && !m.streaming,
-          editing: editingIdx === i, editValue: editText, onEditChange: setEditText,
+          editing: editingIdx === i, editValue: editingIdx === i ? editText : "", onEditChange: setEditText,
           onStartEdit: startEdit, onSaveEdit: saveEdit, onCancelEdit: cancelEdit,
         }))
           : React.createElement(EmptyState, { onSuggestion: (p) => send(p) }),

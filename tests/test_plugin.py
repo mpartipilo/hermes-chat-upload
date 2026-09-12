@@ -178,3 +178,39 @@ def test_active_agent_registry_seeds_reuses_and_lru_evicts(api, monkeypatch):
 def test_session_lock_is_stable_per_session(api):
     assert api._session_lock("same-session") is api._session_lock("same-session")
     assert api._session_lock("same-session") is not api._session_lock("other-session")
+
+
+def test_perf_client_beacon_and_summary(api, client, tmp_path):
+    r = client.post("/perf/client", json={"event": "keystroke", "p50_ms": 4.2, "p95_ms": 11.0, "max_ms": 40.0, "count": 30, "message_count": 12})
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+    perf_file = tmp_path / "plugins" / "web-chat" / "perf" / "client.jsonl"
+    assert perf_file.exists()
+    r2 = client.get("/perf/summary", params={"hours": 24})
+    assert r2.status_code == 200
+    body = r2.json()
+    assert body["client_keystroke_p95_ms"]["count"] == 1
+    assert body["client_keystroke_p95_ms"]["p95_ms"] == 11.0
+
+
+def test_perf_summary_aggregates_turns(api, tmp_path):
+    api._perf_append("turns.jsonl", {"session_id": "s1", "ok": True, "total_ms": 500.0, "first_delta_ms": 200.0})
+    api._perf_append("turns.jsonl", {"session_id": "s1", "ok": True, "total_ms": 1500.0, "first_delta_ms": 900.0})
+    api._perf_append("turns.jsonl", {"session_id": "s2", "ok": False, "total_ms": 4000.0, "first_delta_ms": None})
+    stats = api._perf_read("turns.jsonl")
+    assert len(stats) == 3
+    total_ms = [t["total_ms"] for t in stats]
+    agg = api._perf_stats(total_ms)
+    assert agg["count"] == 3
+    assert agg["max_ms"] == 4000.0
+    failures = [t for t in stats if not t.get("ok", True)]
+    assert len(failures) == 1
+
+
+def test_perf_read_respects_since_window(api, tmp_path):
+    import time as _time
+    api._perf_append("client.jsonl", {"event": "keystroke", "p95_ms": 999.0, "ts": _time.time() - 100000})
+    api._perf_append("client.jsonl", {"event": "keystroke", "p95_ms": 5.0, "ts": _time.time()})
+    recent = api._perf_read("client.jsonl", since_s=_time.time() - 60)
+    assert len(recent) == 1
+    assert recent[0]["p95_ms"] == 5.0
