@@ -982,104 +982,108 @@ async def stream_ws(ws: WebSocket) -> None:
             session_id, question, choices, multi_select, questions=questions, loop=loop)
 
     _register_ws(session_id, ws)
+    try:
+        async with _session_lock(session_id):
+            # History comes from the REAL store (state.db) — the same sessions the
+            # dashboard/desktop/gateway see. The agent persists to it itself.
+            history = _load_session_messages(session_id)
+            agent_history = _agent_history_from_chat_upload(history)
 
-    async with _session_lock(session_id):
-        # History comes from the REAL store (state.db) — the same sessions the
-        # dashboard/desktop/gateway see. The agent persists to it itself.
-        history = _load_session_messages(session_id)
-        agent_history = _agent_history_from_chat_upload(history)
-
-        def _run_agent():
+            def _run_agent():
+                try:
+                    ha_path = str(Path(get_hermes_home()).expanduser() / "hermes-agent")
+                    if ha_path not in sys.path: sys.path.insert(0, ha_path)
+                    from run_agent import AIAgent
+                    from hermes_cli.config import cfg_get, load_config
+                    cfg = load_config()
+                    default_model = cfg_get(cfg, "model", "default", default="")
+                    default_provider = cfg_get(cfg, "model", "provider", default=None)
+                    use_model = model or default_model
+                    use_provider = default_provider
+                    # The per-chat model picker lists models across EVERY configured provider
+                    # (see /api/model/options), but the frontend sends back only a bare model
+                    # id -- no provider. Blindly using the global default_provider here breaks
+                    # every non-default-provider pick: e.g. selecting an anthropic model while
+                    # the daily driver is ollama-cloud sent claude-sonnet-5 to ollama-cloud,
+                    # which 404'd "model not found" on every retry with no visible chat
+                    # response (the error only reached a log/status frame, not a message
+                    # bubble -- the message appears sent but the agent never replies).
+                    # Auto-detect the real provider for an explicitly-picked non-default
+                    # model, same helper the TUI's /model command uses for this scenario.
+                    if use_model and use_model != default_model:
+                        try:
+                            from hermes_cli.models import detect_provider_for_model
+                            detected = detect_provider_for_model(use_model, default_provider or "")
+                            if detected:
+                                use_provider, use_model = detected
+                        except Exception:
+                            log.debug("web-chat: provider auto-detect failed for model=%s", use_model, exc_info=True)
+                    # Effort: explicit per-turn override wins; else the config's
+                    # resolved reasoning config (per-model override > global).
+                    reasoning_config = None
+                    if effort:
+                        from hermes_constants import parse_reasoning_effort
+                        reasoning_config = parse_reasoning_effort(effort)
+                    else:
+                        from hermes_constants import resolve_reasoning_config
+                        reasoning_config = resolve_reasoning_config(cfg, use_model)
+                    def _agent_factory(**kwargs):
+                        return AIAgent(
+                            model=use_model, provider=use_provider,
+                            reasoning_config=reasoning_config, **kwargs)
+                    agent = _get_active_agent(
+                        session_id,
+                        profile,
+                        _agent_factory,
+                        history=agent_history,
+                        model=use_model,
+                        callbacks={
+                            "tool_start_callback": _on_tool_start,
+                            "tool_complete_callback": _on_tool_complete,
+                            "stream_delta_callback": _on_delta,
+                            "clarify_callback": _on_clarify,
+                        },
+                    )
+                    response = _run_agent_turn(agent, user_text)
+                    result_holder.append(response or "")
+                except Exception as exc:
+                    log.exception("web-chat agent error"); error_holder.append(str(exc))
+            thread = threading.Thread(target=_run_agent, daemon=True); thread.start()
+            full_parts: list[str] = []
             try:
-                ha_path = str(Path(get_hermes_home()).expanduser() / "hermes-agent")
-                if ha_path not in sys.path: sys.path.insert(0, ha_path)
-                from run_agent import AIAgent
-                from hermes_cli.config import cfg_get, load_config
-                cfg = load_config()
-                default_model = cfg_get(cfg, "model", "default", default="")
-                default_provider = cfg_get(cfg, "model", "provider", default=None)
-                use_model = model or default_model
-                use_provider = default_provider
-                # The per-chat model picker lists models across EVERY configured provider
-                # (see /api/model/options), but the frontend sends back only a bare model
-                # id -- no provider. Blindly using the global default_provider here breaks
-                # every non-default-provider pick: e.g. selecting an anthropic model while
-                # the daily driver is ollama-cloud sent claude-sonnet-5 to ollama-cloud,
-                # which 404'd "model not found" on every retry with no visible chat
-                # response (the error only reached a log/status frame, not a message
-                # bubble -- the message appears sent but the agent never replies).
-                # Auto-detect the real provider for an explicitly-picked non-default
-                # model, same helper the TUI's /model command uses for this scenario.
-                if use_model and use_model != default_model:
-                    try:
-                        from hermes_cli.models import detect_provider_for_model
-                        detected = detect_provider_for_model(use_model, default_provider or "")
-                        if detected:
-                            use_provider, use_model = detected
-                    except Exception:
-                        log.debug("web-chat: provider auto-detect failed for model=%s", use_model, exc_info=True)
-                # Effort: explicit per-turn override wins; else the config's
-                # resolved reasoning config (per-model override > global).
-                reasoning_config = None
-                if effort:
-                    from hermes_constants import parse_reasoning_effort
-                    reasoning_config = parse_reasoning_effort(effort)
-                else:
-                    from hermes_constants import resolve_reasoning_config
-                    reasoning_config = resolve_reasoning_config(cfg, use_model)
-                def _agent_factory(**kwargs):
-                    return AIAgent(
-                        model=use_model, provider=use_provider,
-                        reasoning_config=reasoning_config, **kwargs)
-                agent = _get_active_agent(
-                    session_id,
-                    profile,
-                    _agent_factory,
-                    history=agent_history,
-                    model=use_model,
-                    callbacks={
-                        "tool_start_callback": _on_tool_start,
-                        "tool_complete_callback": _on_tool_complete,
-                        "stream_delta_callback": _on_delta,
-                        "clarify_callback": _on_clarify,
-                    },
-                )
-                response = _run_agent_turn(agent, user_text)
-                result_holder.append(response or "")
-            except Exception as exc:
-                log.exception("web-chat agent error"); error_holder.append(str(exc))
-        thread = threading.Thread(target=_run_agent, daemon=True); thread.start()
-        full_parts: list[str] = []
+                while thread.is_alive() or not q.empty():
+                    try: frame = await asyncio.wait_for(q.get(), timeout=0.1)
+                    except asyncio.TimeoutError: continue
+                    if frame.get("type") == "delta": full_parts.append(frame.get("text", ""))
+                    await ws.send_text(json.dumps(frame))
+            except WebSocketDisconnect:
+                return
+            thread.join(timeout=5)
+            _turn_total_ms = (time.monotonic() - _turn_t0) * 1000.0
+            _first_delta_ms = ((_first_delta_at[0] - _turn_t0) * 1000.0) if _first_delta_at else None
+            _perf_append("turns.jsonl", {
+                "session_id": session_id,
+                "profile": profile or "default",
+                "model": model or "",
+                "ok": not bool(error_holder),
+                "total_ms": round(_turn_total_ms, 1),
+                "first_delta_ms": round(_first_delta_ms, 1) if _first_delta_ms is not None else None,
+                "tool_calls": len(_tool_calls),
+                "tool_names": _tool_calls[:10],
+                "input_chars": len(user_text),
+                "output_chars": len("".join(full_parts)) if full_parts else 0,
+            })
+            if error_holder:
+                await ws.send_text(json.dumps({"type": "error", "text": error_holder[0]}))
+            else:
+                full = result_holder[0] if result_holder else "".join(full_parts)
+                # The agent persisted the turn to state.db itself; just echo the
+                # final text so the UI can finalize the streaming bubble.
+                await ws.send_text(json.dumps({"type": "done", "text": full, "session_id": session_id}))
+                await ws.send_text(json.dumps({"type": "clear"}))
+    finally:
+        _unregister_ws(session_id, ws)
         try:
-            while thread.is_alive() or not q.empty():
-                try: frame = await asyncio.wait_for(q.get(), timeout=0.1)
-                except asyncio.TimeoutError: continue
-                if frame.get("type") == "delta": full_parts.append(frame.get("text", ""))
-                await ws.send_text(json.dumps(frame))
-        except WebSocketDisconnect:
-            return
-        thread.join(timeout=5)
-        _turn_total_ms = (time.monotonic() - _turn_t0) * 1000.0
-        _first_delta_ms = ((_first_delta_at[0] - _turn_t0) * 1000.0) if _first_delta_at else None
-        _perf_append("turns.jsonl", {
-            "session_id": session_id,
-            "profile": profile or "default",
-            "model": model or "",
-            "ok": not bool(error_holder),
-            "total_ms": round(_turn_total_ms, 1),
-            "first_delta_ms": round(_first_delta_ms, 1) if _first_delta_ms is not None else None,
-            "tool_calls": len(_tool_calls),
-            "tool_names": _tool_calls[:10],
-            "input_chars": len(user_text),
-            "output_chars": len("".join(full_parts)) if full_parts else 0,
-        })
-        if error_holder:
-            await ws.send_text(json.dumps({"type": "error", "text": error_holder[0]}))
-        else:
-            full = result_holder[0] if result_holder else "".join(full_parts)
-            # The agent persisted the turn to state.db itself; just echo the
-            # final text so the UI can finalize the streaming bubble.
-            await ws.send_text(json.dumps({"type": "done", "text": full, "session_id": session_id}))
-            await ws.send_text(json.dumps({"type": "clear"}))
-    _unregister_ws(session_id, ws)
-    await ws.close()
+            await ws.close()
+        except Exception:
+            pass
