@@ -101,7 +101,20 @@ class HermesServeClient:
                 self._ws = None
             ticket = await self._login_and_get_ticket()
             url = f"ws://127.0.0.1:{self.port}/api/ws?ticket={ticket}"
-            self._ws = await websockets.connect(url, ping_interval=20, ping_timeout=20)
+            # Default max_size (1 MiB) is too small for this protocol: the gateway's
+            # own WS contract explicitly supports frames well over 16 MiB (file.attach
+            # payloads, per tui_gateway/server.py's DESKTOP_BACKEND_CONTRACT changelog,
+            # "v5 ws_max_size >16 MiB file.attach frames") -- a large tool-output delta,
+            # history replay, or attachment frame trips the 1 MiB default and the
+            # library hard-closes the connection with 1009 (message too big), no close
+            # frame, surfacing as a bare "hermes serve WS closed" with no indication of
+            # WHY. Observed live: 9 such closes in ~30s on 2026-09-15 right after the
+            # backend flag went live for real traffic. Match the gateway's OWN internal
+            # client (tui_gateway/event_publisher.py uses max_size=None, i.e.
+            # unlimited) rather than picking an arbitrary cap that could still be too
+            # small for some future frame type.
+            self._ws = await websockets.connect(
+                url, ping_interval=20, ping_timeout=20, max_size=None)
             self._recv_task = asyncio.create_task(self._recv_loop())
             log.info("web-chat: connected to hermes serve profile=%s port=%s", self.profile, self.port)
 
