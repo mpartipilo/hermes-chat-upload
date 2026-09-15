@@ -100,7 +100,18 @@ _USE_SERVE_BACKEND = os.getenv("HERMES_CHAT_USE_SERVE_BACKEND", "0") == "1"
 
 
 def _serve_client(profile: Optional[str] = None):
-    """Lazy import so a broken/absent serve_client never breaks the DB path."""
+    """Lazy import so a broken/absent serve_client never breaks the DB path.
+
+    serve_client.py lives next to this file (dashboard/), but the plugin loader
+    does not add this directory to sys.path -- only manual dev/test scripts did
+    (via an explicit sys.path.insert), which is why Task 2's smoke tests passed
+    while the real mounted route 500'd with ModuleNotFoundError. Add this file's
+    own directory to sys.path (once) before importing, so both the real plugin
+    loader and any dev script resolve the same module.
+    """
+    _this_dir = str(Path(__file__).resolve().parent)
+    if _this_dir not in sys.path:
+        sys.path.insert(0, _this_dir)
     from serve_client import get_client
     return get_client(profile)
 
