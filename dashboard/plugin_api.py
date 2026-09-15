@@ -60,6 +60,97 @@ _pending_clarify: dict[str, dict[str, Any]] = {}
 # Mirrors web/src/pages/SessionsPage.tsx AUTOMATION_SESSION_SOURCES so the
 # web-chat session list matches the dashboard's default "Chats" filter.
 _AUTOMATION_SESSION_SOURCES = ["cron", "tool", "api_server", "acp", "hermes_flow", "vulcan_delegate", "webhook"]
+
+# TEMPORARY migration aid (see ~/.hermes/plans/2026-09-14_090000-web-chat-hermes-serve-backend.md).
+# Routes reads through `hermes serve` RPC instead of direct state.db access so web-chat can see
+# sessions live in OTHER processes (desktop/TUI) -- the root cause of invisible clarify prompts.
+# DELETE this flag (and the DB fallback branches) in the plan's final cleanup task.
+_USE_SERVE_BACKEND = os.getenv("HERMES_CHAT_USE_SERVE_BACKEND", "0") == "1"
+
+
+def _serve_client(profile: Optional[str] = None):
+    """Lazy import so a broken/absent serve_client never breaks the DB path."""
+    from serve_client import get_client
+    return get_client(profile)
+
+
+def _map_serve_session_row(row: dict[str, Any]) -> dict[str, Any]:
+    """`session.list` row -> the shape web-chat's frontend already consumes.
+
+    Field parity is NOT exact (verified against tui_gateway's _session_row_summary):
+    the RPC carries only id/title/preview/started_at/message_count/source, so
+    `updated_at` falls back to started_at and `model` is unavailable here. The
+    gateway also applies its OWN deny-list (kanban, tool) which differs from
+    web-chat's automation set, so the automation filter is re-applied by the
+    caller to keep the dashboard-parity the session list is supposed to have.
+    """
+    sid = row.get("id") or row.get("session_id")
+    started = row.get("started_at") or 0
+    return {
+        "session_id": sid,
+        "title": row.get("title") or "New chat",
+        "preview": (row.get("preview") or "")[:120],
+        "created_at": started,
+        "updated_at": started,
+        "message_count": row.get("message_count") or 0,
+        "source": row.get("source") or "",
+        "model": "",
+        "is_busy": _session_busy(sid) if sid else False,
+    }
+
+
+def _map_serve_message(m: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """`session.resume` message -> web-chat's UI message shape, or None to drop.
+
+    tui_gateway's _history_to_messages already emits {role,text,...} and already
+    drops hidden/empty rows, but it KEEPS role="tool" rows (web-chat's own
+    _load_session_messages filters to user/assistant only). Preserve web-chat's
+    existing behaviour so the transcript renders identically across the flag.
+    It also exposes `row_id` -- the durable DB row identity the desktop's rewind
+    uses -- which web-chat's edit-and-resend will need, so carry it through.
+    """
+    role = m.get("role")
+    if role not in ("user", "assistant"):
+        return None
+    text = str(m.get("text") or m.get("content") or "").strip()
+    if not text:
+        return None
+    out = {
+        "id": m.get("row_id"),
+        "role": role,
+        "text": text,
+        "content": text,
+        "timestamp": m.get("timestamp") or time.time(),
+    }
+    if m.get("row_id") is not None:
+        out["row_id"] = m["row_id"]
+    return out
+
+
+async def _load_session_via_serve(session_id: str, profile: Optional[str] = None) -> dict[str, Any]:
+    """`session.resume` -> {messages, model, is_busy}. Uses the PERSISTED id
+    (session_key/resumed) for identity, never the ephemeral runtime session_id."""
+    result = await _serve_client(profile).rpc(
+        "session.resume", {"session_id": session_id, "omit_messages": False})
+    messages = [mm for mm in (_map_serve_message(m) for m in (result.get("messages") or [])) if mm]
+    info = result.get("info") or {}
+    return {
+        "messages": messages,
+        "model": info.get("model") or "",
+        "is_busy": bool(result.get("running")),
+        "session_key": result.get("session_key") or result.get("resumed") or session_id,
+    }
+
+
+async def _list_sessions_via_serve(profile: Optional[str] = None) -> list[dict[str, Any]]:
+    """`session.list` + web-chat's own automation filter (gateway's deny-list is
+    only {kanban, tool}; over-fetch so post-filtering still fills the page)."""
+    result = await _serve_client(profile).rpc("session.list", {"limit": 200})
+    rows = result.get("sessions") or []
+    denied = {s.lower() for s in _AUTOMATION_SESSION_SOURCES}
+    out = [_map_serve_session_row(r) for r in rows
+           if (r.get("source") or "").strip().lower() not in denied]
+    return out[:50]
 # Default raised from 300s (5min) -> 3600s (1hr): the old timeout silently
 # expired clarify cards the user hadn'''t seen yet (backgrounded tab, mobile
 # tab suspension, or simply not looking at that chat) -- the agent then
@@ -645,6 +736,8 @@ async def profiles():
 
 @router.get("/sessions")
 async def sessions_list(profile: Optional[str] = Query(None)):
+    if _USE_SERVE_BACKEND:
+        return {"sessions": await _list_sessions_via_serve(profile)}
     return {"sessions": _list_sessions(profile)}
 
 @router.post("/sessions")
@@ -656,6 +749,13 @@ async def sessions_create(req: SessionSaveRequest):
 async def sessions_get(session_id: str, profile: Optional[str] = Query(None)):
     if not _valid_session_id(session_id):
         raise HTTPException(status_code=400, detail="invalid session_id")
+    if _USE_SERVE_BACKEND:
+        served = await _load_session_via_serve(session_id, profile)
+        if not served["messages"]:
+            raise HTTPException(status_code=404, detail="session not found")
+        return {"session_id": session_id, "messages": served["messages"],
+                "history": served["messages"], "model": served["model"],
+                "is_busy": served["is_busy"]}
     messages = _load_session_messages(session_id, profile)
     if not messages:
         raise HTTPException(status_code=404, detail="session not found")

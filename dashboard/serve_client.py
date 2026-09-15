@@ -84,8 +84,13 @@ class HermesServeClient:
 
     async def ensure_connected(self) -> None:
         async with self._connect_lock:
-            if self._ws is not None and not self._ws.closed:
-                return
+            # websockets>=14 dropped `.closed`; `.state` is the supported probe.
+            # (websockets 15.0.1 in /opt/hermes/.venv -- verified live.)
+            if self._ws is not None and getattr(self._ws, "state", None) is not None:
+                from websockets.protocol import State
+                if self._ws.state is State.OPEN:
+                    return
+                self._ws = None
             ticket = await self._login_and_get_ticket()
             url = f"ws://127.0.0.1:{self.port}/api/ws?ticket={ticket}"
             self._ws = await websockets.connect(url, ping_interval=20, ping_timeout=20)
