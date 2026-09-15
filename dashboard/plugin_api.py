@@ -7,6 +7,7 @@ cards, and model/effort selection.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hmac
 import io
 import json
@@ -57,6 +58,20 @@ _ws_by_session: dict[str, WebSocket] = {}
 # stores under the single "qanswer" key. `done` is a threading.Event set when the
 # browser answers (or the timeout fires); the agent thread waits on it.
 _pending_clarify: dict[str, dict[str, Any]] = {}
+
+# Serve-backend clarify cards awaiting a browser answer: request_id -> {session_id,
+# client, params}. Separate from _pending_clarify (which owns the in-process agent's
+# threading.Event round trip); here the gateway owns the blocking and we just need
+# enough context to route the answer back over the right client.
+_serve_clarify_pending: dict[str, dict[str, Any]] = {}
+
+# Upper bound on how many sessions the badge poll probes per tick: the endpoint
+# runs on a timer, so an unbounded scan would grow with session count.
+_CLARIFY_SCAN_LIMIT = int(os.getenv("HERMES_CHAT_CLARIFY_SCAN_LIMIT", "25"))
+
+# `source` stamped on sessions web-chat creates via hermes serve, so the existing
+# source-based cross-talk guard keeps recognizing them as web-chat's own.
+_WEBCHAT_SOURCE = "dashboard-plugin:web-chat"
 # Mirrors web/src/pages/SessionsPage.tsx AUTOMATION_SESSION_SOURCES so the
 # web-chat session list matches the dashboard's default "Chats" filter.
 _AUTOMATION_SESSION_SOURCES = ["cron", "tool", "api_server", "acp", "hermes_flow", "vulcan_delegate", "webhook"]
@@ -924,16 +939,75 @@ async def upload(file: UploadFile = File(...), session_id: str = Form(...)):
         warning = "Potentially executable file uploaded; inspect before running."
     return {"ok": True, "session_id": sid, "filename": dest.name, "original_filename": file.filename, "path": str(dest), "url": f"/api/plugins/web-chat/file?path={dest}", "type": typ, "content_type": file.content_type, "size": len(raw), "warning": warning}
 
+async def _serve_open_clarify(session_id: str, profile: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """`session.resume(omit_messages)` -> the session's open clarify request, if any.
+    Reads `open_requests`, the gateway's own reconnect-snapshot surface, so a question
+    raised in ANY process (desktop/TUI included) is visible here."""
+    try:
+        r = await _serve_client(profile).rpc(
+            "session.resume", {"session_id": session_id, "omit_messages": True})
+    except Exception:
+        return None
+    for req in (r.get("open_requests") or []):
+        if req.get("method") == "clarify":
+            return {"request_id": str(req.get("id") or ""), "params": req.get("params") or {},
+                    "session_key": str(r.get("session_key") or session_id),
+                    "client": _serve_client(profile)}
+    return None
+
+
+async def _serve_pending_clarify_for(session_id: str, profile: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """The exact WS frame shape the browser's ClarifyCard expects, or None."""
+    found = await _serve_open_clarify(session_id, profile)
+    if not found:
+        return None
+    rid, params = found["request_id"], found["params"]
+    _serve_clarify_pending.setdefault(rid, {
+        "session_id": found["session_key"], "client": found["client"], "params": params,
+        "answers": dict(params.get("answers") or {})})
+    frame: dict[str, Any] = {"type": "clarify", "request_id": rid}
+    if params.get("questions"):
+        frame["questions"] = params["questions"]
+    else:
+        frame["question"] = params.get("question") or ""
+        frame["choices"] = params.get("choices") or []
+    return frame
+
+
+async def _serve_pending_clarify_sessions() -> list[str]:
+    """Session ids currently blocked on a clarify, across the listed sessions.
+    Bounded to the visible list so this stays a cheap poll."""
+    try:
+        rows = await _list_sessions_via_serve(None)
+    except Exception:
+        return []
+    sids = [r["session_id"] for r in rows if r.get("session_id")][:_CLARIFY_SCAN_LIMIT]
+    if not sids:
+        return []
+    # Sequential probing cost ~2s for 15 sessions -- far too slow for a polled
+    # badge endpoint. Fan out instead: one resume per session, concurrently.
+    results = await asyncio.gather(
+        *(_serve_open_clarify(sid) for sid in sids), return_exceptions=True)
+    return [sid for sid, found in zip(sids, results)
+            if found and not isinstance(found, BaseException)]
+
+
 @router.get("/pending_clarify_sessions")
 async def pending_clarify_sessions():
     """All session_ids across every profile with an unanswered clarify card right
     now -- powers the sidebar badge so a pending question in a BACKGROUND chat is
     visible without having to open that chat (see pending_clarify below, which is
     the single-session recovery poll this complements)."""
-    return {"session_ids": sorted({
+    ids = {
         p["session_id"] for p in _pending_clarify.values()
         if p.get("payload") and not p["done"].is_set()
-    })}
+    }
+    if _USE_SERVE_BACKEND:
+        # Serve-backed cards: ask the gateway which sessions are blocked on a
+        # question RIGHT NOW -- including turns driven by desktop/TUI, which the
+        # in-process _pending_clarify map can never see.
+        ids |= set(await _serve_pending_clarify_sessions())
+    return {"session_ids": sorted(ids)}
 
 
 @router.get("/pending_clarify")
@@ -947,6 +1021,10 @@ async def pending_clarify(session_id: str):
     for rid, pending in list(_pending_clarify.items()):
         if pending.get("session_id") == session_id and pending.get("payload") and not pending["done"].is_set():
             return {"pending": True, "request_id": rid, "frame": pending["payload"]}
+    if _USE_SERVE_BACKEND:
+        frame = await _serve_pending_clarify_for(session_id)
+        if frame:
+            return {"pending": True, "request_id": frame["request_id"], "frame": frame}
     return {"pending": False}
 
 
@@ -955,6 +1033,22 @@ async def clarify_answer(req: ClarifyAnswerRequest):
     """Answer an in-flight clarify card (virgil-style round trip). The agent
     thread blocked in _clarify_block_in_thread unblocks with the answer."""
     rid = req.request_id
+    served = _serve_clarify_pending.get(rid)
+    if served is not None:
+        # Serve-backend card: answer the gateway's server request directly. The
+        # gateway ALWAYS uses the batch shape (questions[]/qid), so answers are
+        # keyed by qid -- a bare {"answer": ...} reads as empty/skip.
+        params = served.get("params") or {}
+        qs = params.get("questions") or []
+        answers = served.setdefault("answers", {})
+        qid = req.question_id or (qs[0]["qid"] if qs else "q0")
+        answers[qid] = req.answer or ""
+        expected = [q.get("qid") for q in qs] or [qid]
+        remaining = [q for q in expected if q not in answers]
+        if not remaining:
+            await served["client"].respond_to_request(rid, {"answers": dict(answers)})
+            _serve_clarify_pending.pop(rid, None)
+        return {"ok": True, "request_id": rid, "remaining": remaining}
     pending = _pending_clarify.get(rid)
     if not pending:
         raise HTTPException(status_code=404, detail="no pending clarify for this request id (expired?)")
@@ -1027,6 +1121,172 @@ async def stop(req: StopRequest):
         return {"ok": False, "reason": str(exc)}
 
 
+async def _stream_via_serve(ws: WebSocket, msg: dict[str, Any]) -> None:
+    """Drive one turn through `hermes serve` instead of an in-process AIAgent.
+
+    This is the fix for the whole investigation: the turn runs inside the SAME
+    per-profile serve daemon the desktop/TUI use, so clarify/approval prompts and
+    busy state are visible across surfaces instead of being trapped in whichever
+    process happened to start the turn.
+
+    Frame contract to the browser is UNCHANGED (session/status/delta/clarify/
+    clarify.expire/done/clear/error) so `src/index.jsx` needs no edits.
+    """
+    user_text = str(msg["text"])
+    profile = msg.get("profile")
+    client_sid = _safe_session_id(msg.get("session_id"))
+    model = msg.get("model") or ""
+    client = _serve_client(profile)
+    loop = asyncio.get_event_loop()
+    q: asyncio.Queue = asyncio.Queue()
+
+    def _push(frame: dict[str, Any]) -> None:
+        # Handlers fire on the client's recv task (same loop) -- put_nowait is safe
+        # and avoids the cross-thread round trip the in-process path needs.
+        try:
+            q.put_nowait(frame)
+        except Exception:
+            log.exception("web-chat: failed to enqueue relay frame")
+
+    # ---- resolve the session on the serve side -------------------------------
+    runtime_sid = ""
+    stored_sid = client_sid
+    _resume_result: dict[str, Any] = {}
+    try:
+        r = await client.rpc("session.resume", {"session_id": client_sid, "omit_messages": True})
+        _resume_result = r
+        runtime_sid = str(r.get("session_id") or "")
+        stored_sid = str(r.get("session_key") or r.get("resumed") or client_sid)
+    except Exception:
+        # Unknown to hermes serve (fresh client-minted uuid): create it.
+        created = await client.rpc(
+            "session.create", {"title": "New chat", "source": _WEBCHAT_SOURCE})
+        runtime_sid = str(created.get("session_id") or "")
+        stored_sid = str(created.get("stored_session_id") or runtime_sid)
+    if not runtime_sid:
+        await ws.send_text(json.dumps({"type": "error", "text": "could not resolve session"}))
+        return
+    # Tell the browser the canonical id; its existing renameKey path migrates state.
+    await ws.send_text(json.dumps({"type": "session", "session_id": stored_sid}))
+    await ws.send_text(json.dumps({"type": "status", "label": "thinking"}))
+
+    # ---- relay: gateway events -> existing browser frames ---------------------
+    finished = asyncio.Event()
+
+    def _replay_open_requests(resume_result: dict[str, Any]) -> None:
+        """A clarify raised BEFORE we attached (e.g. the turn is running in the
+        desktop/TUI process) never arrives as a live frame -- the gateway wrote it
+        to whichever transport owned the session then. `session.resume` returns it
+        in `open_requests` precisely so a late/reconnecting client can render it.
+        Without this, a cross-surface clarify stays invisible: the exact bug this
+        whole migration exists to fix."""
+        for req in (resume_result.get("open_requests") or []):
+            if req.get("method") != "clarify":
+                continue
+            rid, params = str(req.get("id") or ""), (req.get("params") or {})
+            if not rid or rid in _serve_clarify_pending:
+                continue
+            frame = {"type": "clarify", "request_id": rid}
+            if params.get("questions"):
+                frame["questions"] = params["questions"]
+            else:
+                frame["question"] = params.get("question") or ""
+                frame["choices"] = params.get("choices") or []
+            _serve_clarify_pending[rid] = {
+                "session_id": stored_sid, "client": client, "params": params,
+                "answers": dict(params.get("answers") or {})}
+            _push(frame)
+
+    def _mine(sid: str) -> bool:
+        # Cross-session stream leak guard (hermes-chat-frontend skill): only this
+        # turn's session may write to this socket.
+        return not sid or sid in (runtime_sid, stored_sid)
+
+    def _on_event(etype: str, sid: str, payload: dict[str, Any]) -> None:
+        if not _mine(sid):
+            return
+        if etype == "message.delta":
+            text = payload.get("text") or ""
+            if text:
+                _push({"type": "status", "label": "responding"})
+                _push({"type": "delta", "text": text})
+        elif etype == "tool.start":
+            name = str(payload.get("name") or payload.get("tool") or "")
+            if name and not name.startswith("_"):
+                _push({"type": "status", "label": _tool_label(name)})
+        elif etype == "tool.complete":
+            _push({"type": "status", "label": "thinking"})
+        elif etype == "status.update":
+            label = payload.get("text") or payload.get("kind") or ""
+            if label:
+                _push({"type": "status", "label": str(label)})
+        elif etype == "message.complete":
+            _push({"type": "done", "text": str(payload.get("text") or ""), "session_id": stored_sid})
+            _push({"type": "clear"})
+            loop.call_soon_threadsafe(finished.set)
+        elif etype == "error":
+            _push({"type": "error", "text": str(payload.get("text") or payload.get("message") or "agent error")})
+            loop.call_soon_threadsafe(finished.set)
+        elif etype == "request.cancel":
+            # The gateway withdrew a pending clarify/approval (timeout, /approve all,
+            # answered on another surface) -- clear the card instead of leaving it stuck.
+            rid = str(payload.get("id") or "")
+            if rid:
+                _push({"type": "clarify.expire", "request_id": rid})
+
+    def _on_request(request_id: str, method: str, sid: str, params: dict[str, Any]) -> None:
+        if not _mine(sid):
+            return
+        if method != "clarify":
+            # approval/sudo/etc: Task 6. Answering nothing would hang the agent, so
+            # decline explicitly rather than silently blocking (the exact failure
+            # mode this migration exists to eliminate).
+            asyncio.run_coroutine_threadsafe(
+                client.respond_to_request(request_id, {"choice": "deny"} if method == "approval" else {"value": ""}),
+                loop)
+            return
+        # The gateway ALWAYS sends the batch shape (questions[] with qid), even for
+        # a single question -- verified live. Forward it verbatim: the frontend's
+        # ClarifyCard already consumes {questions:[{qid,question,choices,multi_select}]}.
+        frame = {"type": "clarify", "request_id": request_id}
+        if params.get("questions"):
+            frame["questions"] = params["questions"]
+        else:
+            frame["question"] = params.get("question") or ""
+            frame["choices"] = params.get("choices") or []
+            frame["multi_select"] = bool(params.get("multi_select"))
+        _serve_clarify_pending[request_id] = {
+            "session_id": stored_sid, "client": client, "params": params}
+        _push(frame)
+
+    client.on_event(_on_event)
+    client.on_server_request(_on_request)
+    if _resume_result:
+        _replay_open_requests(_resume_result)
+    try:
+        await client.rpc("prompt.submit", {"session_id": runtime_sid, "text": user_text})
+        while True:
+            try:
+                frame = await asyncio.wait_for(q.get(), timeout=0.25)
+            except asyncio.TimeoutError:
+                if finished.is_set() and q.empty():
+                    break
+                continue
+            await ws.send_text(json.dumps(frame))
+    except WebSocketDisconnect:
+        return
+    finally:
+        # Detach this turn's handlers so a long-lived client doesn't accumulate them.
+        for lst, fn in ((client._event_handlers, _on_event), (client._request_handlers, _on_request)):
+            try:
+                lst.remove(fn)
+            except ValueError:
+                pass
+        for rid, meta in list(_serve_clarify_pending.items()):
+            if meta.get("session_id") == stored_sid:
+                _serve_clarify_pending.pop(rid, None)
+
+
 @router.websocket("/stream")
 async def stream_ws(ws: WebSocket) -> None:
     token = ws.query_params.get("token", "")
@@ -1041,6 +1301,19 @@ async def stream_ws(ws: WebSocket) -> None:
         await ws.send_text(json.dumps({"type": "error", "text": f"Bad handshake: {exc}"})); await ws.close(); return
     if msg.get("type") != "message" or not msg.get("text"):
         await ws.send_text(json.dumps({"type": "error", "text": "Expected {type:message, text:...}"})); await ws.close(); return
+    if _USE_SERVE_BACKEND:
+        try:
+            await _stream_via_serve(ws, msg)
+        except WebSocketDisconnect:
+            pass
+        except Exception as exc:
+            log.exception("web-chat: serve-backend stream failed")
+            with contextlib.suppress(Exception):
+                await ws.send_text(json.dumps({"type": "error", "text": str(exc)}))
+        finally:
+            with contextlib.suppress(Exception):
+                await ws.close()
+        return
     user_text = str(msg["text"])
     session_id = _safe_session_id(msg.get("session_id"))
     # Cross-talk guard: a session id that resolves to a NON-web-chat row (e.g. a
