@@ -1023,6 +1023,50 @@ async def _stream_via_serve(ws: WebSocket, msg: dict[str, Any]) -> None:
         return
     # Tell the browser the canonical id; its existing renameKey path migrates state.
     await ws.send_text(json.dumps({"type": "session", "session_id": stored_sid}))
+
+    # ---- stage any uploaded attachments before the turn -----------------------
+    # /upload already wrote bytes to disk under _uploads_root() (same container
+    # filesystem hermes serve runs in -- no cross-process copy needed). Each
+    # attach RPC re-resolves that path via _stage_session_file_attachment /
+    # _resolve_attachment_path and, since it's already inside the gateway's own
+    # visible filesystem, stages it into the LIVE session's attached_images (or
+    # workspace file ref) so the upcoming prompt.submit picks it up -- exactly
+    # the desktop client's own file.attach/image.attach/pdf.attach flow, just
+    # driven from an already-staged path instead of a fresh drag-drop. Previously
+    # `msg.get("attachments")` was read by nothing: uploads landed on disk and
+    # were silently dropped from every turn under the serve backend.
+    attach_warnings: list[str] = []
+    attach_refs: list[str] = []
+    for att in (msg.get("attachments") or []):
+        att_path = str((att or {}).get("path") or "").strip()
+        if not att_path:
+            continue
+        att_type = str((att or {}).get("type") or "")
+        att_name = str((att or {}).get("original_filename") or (att or {}).get("filename") or "")
+        method = "pdf.attach" if att_type == "pdf" else "image.attach" if att_type == "image" else "file.attach"
+        try:
+            r = await client.rpc(method, {"session_id": runtime_sid, "path": att_path})
+        except Exception as exc:
+            log.warning("web-chat: %s failed for %r: %s", method, att_path, exc)
+            attach_warnings.append(f"Could not attach {att_name or att_path}: {exc}")
+            continue
+        # image.attach/pdf.attach queue into the session's own attached_images list
+        # (consumed automatically by the next prompt.submit -- no text change needed).
+        # file.attach does NOT auto-attach: it only stages the file and returns a
+        # `@file:<ref>` token (agent/context_references.py) that must appear in the
+        # PROMPT TEXT itself to be expanded into content -- exactly how a desktop
+        # user dragging in a non-image file works. Without this, file.attach's
+        # 'attached': True reply looks like success while the model never sees
+        # the file (confirmed live: agent replied "no attachment" despite a
+        # successful file.attach call).
+        ref_text = r.get("ref_text") if method == "file.attach" else None
+        if ref_text:
+            attach_refs.append(str(ref_text))
+    for warning in attach_warnings:
+        await ws.send_text(json.dumps({"type": "error", "text": warning}))
+    if attach_refs:
+        user_text = (user_text + "\n" + "\n".join(attach_refs)) if user_text else "\n".join(attach_refs)
+
     await ws.send_text(json.dumps({"type": "status", "label": "thinking"}))
 
     # ---- relay: gateway events -> existing browser frames ---------------------
