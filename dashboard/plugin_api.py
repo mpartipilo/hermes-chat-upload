@@ -69,6 +69,16 @@ _serve_clarify_pending: dict[str, dict[str, Any]] = {}
 # runs on a timer, so an unbounded scan would grow with session count.
 _CLARIFY_SCAN_LIMIT = int(os.getenv("HERMES_CHAT_CLARIFY_SCAN_LIMIT", "25"))
 
+# Rewind under the serve backend is DEFERRED, not immediate: hermes serve has no
+# truncate-only RPC (session.undo only drops the LAST turn), and a direct state.db
+# rewind does NOT touch a live session's in-memory history -- verified: the DB
+# reported rewound_count=3 while session.resume still returned all 4 messages, so
+# the agent would silently keep the "edited away" turns. The only correct cut is
+# prompt.submit's own `truncate_before_row_id` + `confirm_truncate`, which is
+# atomic with the resend. So /rewind records the cut point here and the next
+# /stream send applies it. session_id -> row_id.
+_pending_truncate: dict[str, int] = {}
+
 # `source` stamped on sessions web-chat creates via hermes serve, so the existing
 # source-based cross-talk guard keeps recognizing them as web-chat's own.
 _WEBCHAT_SOURCE = "dashboard-plugin:web-chat"
@@ -793,6 +803,10 @@ async def sessions_put(session_id: str, req: SessionSaveRequest):
 
 @router.post("/sessions/{session_id}/model")
 async def sessions_set_model(session_id: str, req: SessionModelRequest, profile: Optional[str] = Query(None)):
+    if _USE_SERVE_BACKEND:
+        if not _valid_session_id(session_id):
+            raise HTTPException(status_code=400, detail="invalid session_id")
+        return await _set_model_via_serve(session_id, req.model, profile)
     """Persist the per-session model to the session row so the dashboard and
     web-chat read the SAME source of truth (no more client-side drift)."""
     if not _valid_session_id(session_id):
@@ -809,6 +823,33 @@ async def sessions_set_model(session_id: str, req: SessionModelRequest, profile:
     finally:
         db.close()
     return {"ok": True, "session_id": session_id, "model": model}
+
+
+async def _set_model_via_serve(session_id: str, model: str, profile: Optional[str] = None) -> dict[str, Any]:
+    """`config.set` key=model, session-scoped. The gateway persists the per-session
+    override itself (sessions.model), so no direct DB write -- and unlike the DB path
+    it applies to a LIVE session's next turn even when that turn is being driven from
+    another surface."""
+    client = _serve_client(profile)
+    # `config.set model` resolves `session_id` against the gateway's LIVE _sessions
+    # map, not the store: an idle stored session answers 4001 "requires a live
+    # session". Resume first (registers it + returns the RUNTIME id the setter
+    # expects), then set. Verified live -- passing the stored id straight through
+    # fails for exactly the case web-chat needs (pick a model on an idle chat).
+    resumed = await client.rpc(
+        "session.resume", {"session_id": session_id, "omit_messages": True})
+    runtime_sid = str(resumed.get("session_id") or session_id)
+    r = await client.rpc(
+        "config.set", {"key": "model", "value": model, "session_id": runtime_sid})
+    out: dict[str, Any] = {"ok": True, "session_id": session_id, "model": r.get("value") or model}
+    # The setter can refuse pending confirmation (expensive model) -- surface that
+    # instead of reporting a success that did not happen.
+    for key in ("warning", "confirm_required", "confirm_message", "scope", "deferred"):
+        if r.get(key) is not None:
+            out[key] = r[key]
+    if r.get("confirm_required"):
+        out["ok"] = False
+    return out
 
 def _evict_active_agent(session_id: str) -> None:
     """Drop any cached in-process agent for a session so the next turn rebuilds
@@ -840,6 +881,12 @@ async def sessions_rewind(session_id: str, req: RewindRequest, profile: Optional
     new message afterward; this endpoint only truncates the transcript."""
     if not _valid_session_id(session_id):
         raise HTTPException(status_code=400, detail="invalid session_id")
+    if _USE_SERVE_BACKEND:
+        # Defer: the cut is applied atomically by the next prompt.submit. Returning
+        # ok=True here keeps the frontend's existing two-step flow (rewind, then
+        # resend) working with no UI change.
+        _pending_truncate[session_id] = int(req.message_id)
+        return {"ok": True, "session_id": session_id, "rewound_count": 0, "deferred": True}
     db = _open_db(profile, read_only=False)
     try:
         sid = db.resolve_session_id(session_id)
@@ -910,6 +957,37 @@ async def perf_summary(hours: float = Query(24.0)):
 @router.delete("/sessions/{session_id}")
 async def sessions_delete(session_id: str, profile: Optional[str] = Query(None)):
     if not _valid_session_id(session_id): raise HTTPException(status_code=400, detail="invalid session_id")
+    if _USE_SERVE_BACKEND:
+        client = _serve_client(profile)
+        # `session.delete` refuses ANY session the gateway still holds in _sessions
+        # -- which includes a merely-RESUMED (open, idle) chat, not just a running
+        # turn. Simply opening a chat in web-chat would make it undeletable. So:
+        # refuse only a genuinely RUNNING turn, otherwise release the gateway's
+        # claim with session.close first, then delete.
+        try:
+            live = await client.rpc(
+                "session.resume", {"session_id": session_id, "omit_messages": True})
+        except Exception:
+            live = {}
+        if live.get("running"):
+            raise HTTPException(
+                status_code=409, detail="cannot delete a session while its turn is running")
+        runtime_sid = str(live.get("session_id") or "")
+        if runtime_sid:
+            with contextlib.suppress(Exception):
+                await client.rpc("session.close", {"session_id": runtime_sid})
+        try:
+            await client.rpc("session.delete", {"session_id": session_id})
+        except RuntimeError as exc:
+            detail = str(exc)
+            if "4023" in detail or "active session" in detail:
+                raise HTTPException(status_code=409, detail="cannot delete a session that is currently running")
+            if "4007" not in detail and "not found" not in detail:
+                raise HTTPException(status_code=502, detail=detail)
+        up = _uploads_root() / session_id
+        if up.exists() and _is_inside(up, _uploads_root()):
+            shutil.rmtree(up)
+        return {"ok": True}
     db = _open_db(profile, read_only=False)
     try:
         sid = db.resolve_session_id(session_id)
@@ -1263,8 +1341,15 @@ async def _stream_via_serve(ws: WebSocket, msg: dict[str, Any]) -> None:
     client.on_server_request(_on_request)
     if _resume_result:
         _replay_open_requests(_resume_result)
+    submit_params: dict[str, Any] = {"session_id": runtime_sid, "text": user_text}
+    cut_row = _pending_truncate.pop(stored_sid, None) or _pending_truncate.pop(client_sid, None)
+    if cut_row is not None:
+        # Atomic rewind+resend: the ONLY mapping that also truncates the gateway's
+        # live in-memory history (see _pending_truncate's note).
+        submit_params["truncate_before_row_id"] = int(cut_row)
+        submit_params["confirm_truncate"] = True
     try:
-        await client.rpc("prompt.submit", {"session_id": runtime_sid, "text": user_text})
+        await client.rpc("prompt.submit", submit_params)
         while True:
             try:
                 frame = await asyncio.wait_for(q.get(), timeout=0.25)
