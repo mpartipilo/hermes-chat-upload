@@ -99,7 +99,41 @@ def _serve_client(profile: Optional[str] = None):
     return get_client(profile)
 
 
-def _map_serve_session_row(row: dict[str, Any]) -> dict[str, Any]:
+async def _serve_active_status_map(profile: Optional[str] = None) -> dict[str, str]:
+    """`session.active_list` -> {session_key: status} for every session live in
+    THIS profile's hermes serve process right now -- desktop/TUI/web-chat share one
+    process per profile, and `_sessions` (the map this RPC snapshots) is process-
+    global with no transport scoping, so this sees a turn driven by ANY surface,
+    not just ones web-chat itself opened. ONE call covers the whole list (unlike
+    the clarify badge's necessary per-session gather -- active_list has no
+    per-session fan-out cost since it's already a full-process snapshot).
+
+    Keyed on `session_key` (the PERSISTED id, matching session.list's `id` field),
+    NOT the row's own `id`, which is the ephemeral runtime id -- see session.resume's
+    session_id-vs-session_key split documented in the migration plan's Task 0 finding.
+    """
+    try:
+        result = await _serve_client(profile).rpc("session.active_list", {})
+    except Exception:
+        return {}
+    out: dict[str, str] = {}
+    for row in result.get("sessions") or []:
+        key = row.get("session_key") or row.get("id")
+        if key:
+            out[str(key)] = row.get("status") or "idle"
+    return out
+
+
+def _serve_status_busy(status: str) -> bool:
+    """active_list's `status` is one of idle/waiting/starting/working; treat
+    anything but idle as busy -- "waiting" (blocked on clarify) still owns the
+    turn and must not let a second prompt jump the queue, matching the existing
+    _session_busy semantics (busy spans the whole in-flight window, not just
+    active generation)."""
+    return status not in ("", "idle")
+
+
+def _map_serve_session_row(row: dict[str, Any], status_map: Optional[dict[str, str]] = None) -> dict[str, Any]:
     """`session.list` row -> the shape web-chat's frontend already consumes.
 
     Field parity is NOT exact (verified against tui_gateway's _session_row_summary):
@@ -108,9 +142,19 @@ def _map_serve_session_row(row: dict[str, Any]) -> dict[str, Any]:
     gateway also applies its OWN deny-list (kanban, tool) which differs from
     web-chat's automation set, so the automation filter is re-applied by the
     caller to keep the dashboard-parity the session list is supposed to have.
+
+    `is_busy` ORs two sources: `_session_busy` (this web-chat process's OWN
+    /stream WS registration, covers a turn this tab JUST started before the
+    gateway's active_list snapshot catches up) and `status_map` (the gateway's
+    process-wide view, which is what makes a desktop/TUI-driven turn show up as
+    busy here too -- the actual Task 5 fix; see the plan's Task 3 note that this
+    was deliberately deferred).
     """
     sid = row.get("id") or row.get("session_id")
     started = row.get("started_at") or 0
+    is_busy = False
+    if sid:
+        is_busy = _session_busy(sid) or (bool(status_map) and _serve_status_busy(status_map.get(sid, "")))
     return {
         "session_id": sid,
         "title": row.get("title") or "New chat",
@@ -120,7 +164,7 @@ def _map_serve_session_row(row: dict[str, Any]) -> dict[str, Any]:
         "message_count": row.get("message_count") or 0,
         "source": row.get("source") or "",
         "model": "",
-        "is_busy": _session_busy(sid) if sid else False,
+        "is_busy": is_busy,
     }
 
 
@@ -169,11 +213,19 @@ async def _load_session_via_serve(session_id: str, profile: Optional[str] = None
 
 async def _list_sessions_via_serve(profile: Optional[str] = None) -> list[dict[str, Any]]:
     """`session.list` + web-chat's own automation filter (gateway's deny-list is
-    only {kanban, tool}; over-fetch so post-filtering still fills the page)."""
-    result = await _serve_client(profile).rpc("session.list", {"limit": 200})
-    rows = result.get("sessions") or []
+    only {kanban, tool}; over-fetch so post-filtering still fills the page).
+
+    Fetches `session.active_list` alongside `session.list` (one extra RPC, not
+    per-row) so `is_busy` reflects a turn driven by ANY surface sharing this
+    profile's hermes serve process -- see _map_serve_session_row. A status-map
+    fetch failure degrades to "no live info", never to an exception: a stale/
+    missing busy flag is a cosmetic miss, not worth failing the whole list for."""
+    list_result, status_map = await asyncio.gather(
+        _serve_client(profile).rpc("session.list", {"limit": 200}),
+        _serve_active_status_map(profile))
+    rows = list_result.get("sessions") or []
     denied = {s.lower() for s in _AUTOMATION_SESSION_SOURCES}
-    out = [_map_serve_session_row(r) for r in rows
+    out = [_map_serve_session_row(r, status_map) for r in rows
            if (r.get("source") or "").strip().lower() not in denied]
     return out[:50]
 # Default raised from 300s (5min) -> 3600s (1hr): the old timeout silently
