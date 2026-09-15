@@ -35,6 +35,10 @@ uploads/
 sessions/
 *.log
 
+# Per-profile hermes-serve login credentials (own copy, mirrors virgil-chat's
+# .env pattern) -- never committed, see serve_client.py
+dashboard/serve_credentials.json
+
 # OS
 Thumbs.db
 perf/
