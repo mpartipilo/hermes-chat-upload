@@ -52,8 +52,10 @@ button{touch-action:manipulation;font-family:inherit}
 .wc-messages{flex:1;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:10px 8px;display:flex;flex-direction:column;gap:8px;contain:layout style}
 .wc-jump{position:sticky;bottom:8px;align-self:flex-end;width:36px;height:36px;border-radius:50%;background:var(--wc-accent-strong);color:var(--wc-accent-ink);border:none;font-size:18px;cursor:pointer;box-shadow:0 2px 8px rgb(0 0 0/.4);display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:-44px}
 .wc-row{display:flex;gap:6px;max-width:100%}
+.wc-row.wc-grouped{margin-top:-4px}
 .wc-row.user{justify-content:flex-end}
 .wc-row.assistant{justify-content:flex-start}
+.wc-avatar-spacer{width:24px;flex-shrink:0}
 .wc-avatar{width:24px;height:24px;border-radius:4px;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;background:var(--wc-accent-strong);color:var(--wc-accent-ink)}
 .wc-bubble{max-width:85%;padding:8px 10px;border-radius:6px;font-size:15px;line-height:1.45;word-break:break-word;overflow-wrap:anywhere;color:var(--wc-fg)}
 .wc-row.user .wc-bubble{background:var(--wc-user-bg);border:1px solid var(--wc-user-border);border-bottom-right-radius:2px;white-space:pre-wrap}
@@ -314,12 +316,12 @@ function StatusLine({ label }) {
     React.createElement("span", { className: "wc-dots" }, React.createElement("span"), React.createElement("span"), React.createElement("span")),
     React.createElement("span", null, label + "…"));
 }
-var Bubble = React.memo(function Bubble({ msg, idx, canEdit, editing, editValue, onEditChange, onStartEdit, onSaveEdit, onCancelEdit }) {
+var Bubble = React.memo(function Bubble({ msg, idx, canEdit, editing, editValue, onEditChange, onStartEdit, onSaveEdit, onCancelEdit, grouped }) {
   var role = msg.role || "assistant";
   var text = msg.text || msg.content || "";
   if (role === "assistant") {
-    return React.createElement("div", { className: "wc-row assistant" },
-      React.createElement("div", { className: "wc-avatar" }, "H"),
+    return React.createElement("div", { className: "wc-row assistant" + (grouped ? " wc-grouped" : "") },
+      grouped ? React.createElement("div", { className: "wc-avatar-spacer" }) : React.createElement("div", { className: "wc-avatar" }, "H"),
       React.createElement("div", { className: "wc-bubble" }, React.createElement(AgentContent, { text: text })));
   }
   if (editing) {
@@ -337,7 +339,7 @@ var Bubble = React.memo(function Bubble({ msg, idx, canEdit, editing, editValue,
           React.createElement("button", { className: "wc-edit-btn", onClick: () => onCancelEdit() }, "Cancel"),
           React.createElement("button", { className: "wc-edit-btn primary", onClick: () => onSaveEdit(idx, msg, editValue), disabled: !editValue.trim() }, "Save & resend"))));
   }
-  return React.createElement("div", { className: "wc-row user" },
+  return React.createElement("div", { className: "wc-row user" + (grouped ? " wc-grouped" : "") },
     React.createElement("div", { className: "wc-bubble" }, text,
       canEdit ? React.createElement("button", { className: "wc-edit-trigger", title: "Edit & resend", onClick: () => onStartEdit(idx) }, "\u270E") : null));
 });
@@ -962,6 +964,7 @@ function ChatPage() {
           canEdit: m.role === "user" && !busy && !m.streaming,
           editing: editingIdx === i, editValue: editingIdx === i ? editText : "", onEditChange: setEditText,
           onStartEdit: startEdit, onSaveEdit: saveEdit, onCancelEdit: cancelEdit,
+          grouped: i > 0 && (messages[i - 1].role || "assistant") === (m.role || "assistant"),
         }))
           : React.createElement(EmptyState, { onSuggestion: (p) => send(p) }),
         clarify ? React.createElement(ClarifyCard, { frame: clarify, onAnswer: answerClarify }) : null,
