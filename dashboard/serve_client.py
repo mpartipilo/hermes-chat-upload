@@ -55,6 +55,14 @@ class HermesServeClient:
         self._rpc_id = itertools.count(1)
         self._pending: dict[int, asyncio.Future] = {}
         self._event_handlers: list[Callable[[str, str, dict], None]] = []
+        # Server REQUESTS (clarify/approval/sudo/...) are a separate channel from
+        # events: they arrive as {"id","method","params"} frames -- structurally
+        # identical to our OWN outbound RPCs -- and the gateway BLOCKS the agent
+        # thread until we answer with {"id", "result": {...}}. Without a handler
+        # they are silently dropped and the turn hangs until the tool times out,
+        # which is precisely the invisible-clarify bug this migration exists to
+        # fix (see tui_gateway/server_requests.py + contracts/server_requests.py).
+        self._request_handlers: list[Callable[[str, str, str, dict], None]] = []
         self._connect_lock = asyncio.Lock()
         self._recv_task: Optional[asyncio.Task] = None
 
@@ -104,10 +112,21 @@ class HermesServeClient:
                     frame = json.loads(raw)
                 except Exception:
                     continue
-                if "id" in frame and frame["id"] in self._pending:
+                if "id" in frame and "method" not in frame and frame["id"] in self._pending:
+                    # A RESPONSE to one of our RPCs: has id + result/error, no method.
                     fut = self._pending.pop(frame["id"])
                     if not fut.done():
                         fut.set_result(frame)
+                elif frame.get("method") and frame.get("method") != "event" and "id" in frame:
+                    # A SERVER REQUEST: gateway is blocked waiting for our answer.
+                    p = frame.get("params") or {}
+                    method = str(frame.get("method") or "")
+                    sid = str(p.get("session_id") or "")
+                    for handler in list(self._request_handlers):
+                        try:
+                            handler(frame["id"], method, sid, p)
+                        except Exception:
+                            log.exception("web-chat: server-request handler failed (%s)", method)
                 elif frame.get("method") == "event":
                     p = frame.get("params") or {}
                     for handler in list(self._event_handlers):
@@ -126,6 +145,17 @@ class HermesServeClient:
 
     def on_event(self, handler: Callable[[str, str, dict], None]) -> None:
         self._event_handlers.append(handler)
+
+    def on_server_request(self, handler: Callable[[str, str, str, dict], None]) -> None:
+        """handler(request_id, method, session_id, params). MUST eventually call
+        respond_to_request(request_id, result) or the agent thread stays blocked."""
+        self._request_handlers.append(handler)
+
+    async def respond_to_request(self, request_id: str, result: dict) -> None:
+        """Answer a server request. Shape: {"jsonrpc","id","result"} -- mirrors
+        tui_gateway.server_requests.is_response_frame() (id + result, no method)."""
+        await self.ensure_connected()
+        await self._ws.send(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}))
 
     async def rpc(self, method: str, params: dict, timeout: float = 30.0) -> dict:
         await self.ensure_connected()
