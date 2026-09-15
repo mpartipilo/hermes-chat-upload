@@ -65,6 +65,12 @@ _pending_clarify: dict[str, dict[str, Any]] = {}
 # enough context to route the answer back over the right client.
 _serve_clarify_pending: dict[str, dict[str, Any]] = {}
 
+# Serve-backend APPROVAL cards awaiting a browser answer: request_id -> {session_id,
+# client, params}. Mirrors _serve_clarify_pending exactly -- see Task 6 of the
+# migration plan. Approval requests arrive over the SAME server-request channel as
+# clarify (tui_gateway/server_requests.py), just a different `method`.
+_serve_approval_pending: dict[str, dict[str, Any]] = {}
+
 # Upper bound on how many sessions the badge poll probes per tick: the endpoint
 # runs on a timer, so an unbounded scan would grow with session count.
 _CLARIFY_SCAN_LIMIT = int(os.getenv("HERMES_CHAT_CLARIFY_SCAN_LIMIT", "25"))
@@ -271,6 +277,12 @@ class ClarifyAnswerRequest(BaseModel):
     request_id: str
     answer: Optional[str] = None
     question_id: Optional[str] = None  # qid (q0..q4) for batch shape; None => single-question answer
+
+
+class ApprovalAnswerRequest(BaseModel):
+    request_id: str
+    choice: str = "deny"  # one of once/session/always/deny (server-provided in the card's `choices`)
+    all: bool = False  # resolve every pending approval on this session at once ("/approve all" parity)
 
 
 class StopRequest(BaseModel):
@@ -1069,21 +1081,49 @@ async def upload(file: UploadFile = File(...), session_id: str = Form(...)):
         warning = "Potentially executable file uploaded; inspect before running."
     return {"ok": True, "session_id": sid, "filename": dest.name, "original_filename": file.filename, "path": str(dest), "url": f"/api/plugins/web-chat/file?path={dest}", "type": typ, "content_type": file.content_type, "size": len(raw), "warning": warning}
 
-async def _serve_open_clarify(session_id: str, profile: Optional[str] = None) -> Optional[dict[str, Any]]:
-    """`session.resume(omit_messages)` -> the session's open clarify request, if any.
-    Reads `open_requests`, the gateway's own reconnect-snapshot surface, so a question
-    raised in ANY process (desktop/TUI included) is visible here."""
+async def _serve_open_requests_for(session_id: str, profile: Optional[str] = None) -> dict[str, Any]:
+    """One `session.resume(omit_messages)` call -> {clarify: {...}|None, approval: {...}|None}
+    for the session's open server requests, whichever process (desktop/TUI/web-chat)
+    raised them. Folding both into a SINGLE resume call (rather than one call per kind)
+    keeps the badge poll's per-session cost the same as before Task 6 added a second
+    request type to watch for.
+
+    BOTH kinds are read from `open_requests` (NOT the separate `pending_approval` field
+    server.py also returns) -- verified live that they carry DIFFERENT ids for the same
+    approval: `open_requests[].id` is the WS server-request frame id (`srq-...`, what
+    `respond_to_request()`/`client.respond_to_request(request_id, ...)` must be called
+    with to actually unblock the agent thread), while `pending_approval.request_id` is
+    the approval QUEUE's own internal id (`tools/approval.py`'s `_gateway_queues` key,
+    a plain hex uuid) -- a DIFFERENT namespace. Using the queue id here would silently
+    fail to unblock the agent on the recovery path (a reload-and-answer would look
+    successful in the browser but leave the turn parked until its timeout). The queue id
+    still rides inside `open_requests[].params.request_id` for reference/logging, unused
+    for addressing.
+    """
     try:
         r = await _serve_client(profile).rpc(
             "session.resume", {"session_id": session_id, "omit_messages": True})
     except Exception:
-        return None
+        return {"clarify": None, "approval": None}
+    session_key = str(r.get("session_key") or session_id)
+    clarify_found = None
+    approval_found = None
     for req in (r.get("open_requests") or []):
-        if req.get("method") == "clarify":
-            return {"request_id": str(req.get("id") or ""), "params": req.get("params") or {},
-                    "session_key": str(r.get("session_key") or session_id),
-                    "client": _serve_client(profile)}
-    return None
+        method = req.get("method")
+        if method == "clarify" and clarify_found is None:
+            clarify_found = {"request_id": str(req.get("id") or ""), "params": req.get("params") or {},
+                              "session_key": session_key, "client": _serve_client(profile)}
+        elif method == "approval" and approval_found is None:
+            approval_found = {"request_id": str(req.get("id") or ""), "params": req.get("params") or {},
+                               "session_key": session_key, "client": _serve_client(profile)}
+    return {"clarify": clarify_found, "approval": approval_found}
+
+
+async def _serve_open_clarify(session_id: str, profile: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """`session.resume(omit_messages)` -> the session's open clarify request, if any.
+    Reads `open_requests`, the gateway's own reconnect-snapshot surface, so a question
+    raised in ANY process (desktop/TUI included) is visible here."""
+    return (await _serve_open_requests_for(session_id, profile))["clarify"]
 
 
 async def _serve_pending_clarify_for(session_id: str, profile: Optional[str] = None) -> Optional[dict[str, Any]]:
@@ -1104,39 +1144,66 @@ async def _serve_pending_clarify_for(session_id: str, profile: Optional[str] = N
     return frame
 
 
-async def _serve_pending_clarify_sessions() -> list[str]:
-    """Session ids currently blocked on a clarify, across the listed sessions.
-    Bounded to the visible list so this stays a cheap poll."""
+async def _serve_pending_approval_for(session_id: str, profile: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """The exact WS frame shape the browser's ApprovalCard expects, or None."""
+    found = (await _serve_open_requests_for(session_id, profile))["approval"]
+    if not found:
+        return None
+    rid, params = found["request_id"], found["params"]
+    _serve_approval_pending.setdefault(rid, {
+        "session_id": found["session_key"], "client": found["client"], "params": params})
+    return {
+        "type": "approval", "request_id": rid,
+        "command": params.get("command") or "",
+        "description": params.get("description") or "",
+        "choices": params.get("choices") or ["once", "deny"],
+        "tool_name": params.get("tool_name") or "",
+    }
+
+
+async def _serve_pending_sessions_by_kind() -> tuple[list[str], list[str]]:
+    """(clarify_session_ids, approval_session_ids) across the visible session list.
+    ONE resume call per session covers both kinds (see _serve_open_requests_for),
+    so watching for a second request type costs nothing extra here."""
     try:
         rows = await _list_sessions_via_serve(None)
     except Exception:
-        return []
+        return [], []
     sids = [r["session_id"] for r in rows if r.get("session_id")][:_CLARIFY_SCAN_LIMIT]
     if not sids:
-        return []
-    # Sequential probing cost ~2s for 15 sessions -- far too slow for a polled
-    # badge endpoint. Fan out instead: one resume per session, concurrently.
+        return [], []
     results = await asyncio.gather(
-        *(_serve_open_clarify(sid) for sid in sids), return_exceptions=True)
-    return [sid for sid, found in zip(sids, results)
-            if found and not isinstance(found, BaseException)]
+        *(_serve_open_requests_for(sid) for sid in sids), return_exceptions=True)
+    clarify_ids, approval_ids = [], []
+    for sid, found in zip(sids, results):
+        if isinstance(found, BaseException) or not found:
+            continue
+        if found.get("clarify"):
+            clarify_ids.append(sid)
+        if found.get("approval"):
+            approval_ids.append(sid)
+    return clarify_ids, approval_ids
 
 
 @router.get("/pending_clarify_sessions")
 async def pending_clarify_sessions():
-    """All session_ids across every profile with an unanswered clarify card right
-    now -- powers the sidebar badge so a pending question in a BACKGROUND chat is
-    visible without having to open that chat (see pending_clarify below, which is
-    the single-session recovery poll this complements)."""
+    """All session_ids across every profile with an unanswered clarify OR approval
+    card right now -- powers the sidebar badge so a pending question in a
+    BACKGROUND chat is visible without having to open that chat (see
+    pending_clarify/pending_approval below, the single-session recovery polls this
+    complements). Kept under one response key (`session_ids`) for BOTH kinds since
+    the frontend's badge doesn't need to distinguish which -- either way the chat
+    "needs your answer" before it can continue."""
     ids = {
         p["session_id"] for p in _pending_clarify.values()
         if p.get("payload") and not p["done"].is_set()
     }
     if _USE_SERVE_BACKEND:
         # Serve-backed cards: ask the gateway which sessions are blocked on a
-        # question RIGHT NOW -- including turns driven by desktop/TUI, which the
-        # in-process _pending_clarify map can never see.
-        ids |= set(await _serve_pending_clarify_sessions())
+        # question or approval RIGHT NOW -- including turns driven by desktop/TUI,
+        # which the in-process _pending_clarify map can never see.
+        clarify_ids, approval_ids = await _serve_pending_sessions_by_kind()
+        ids |= set(clarify_ids) | set(approval_ids)
     return {"session_ids": sorted(ids)}
 
 
@@ -1153,6 +1220,20 @@ async def pending_clarify(session_id: str):
             return {"pending": True, "request_id": rid, "frame": pending["payload"]}
     if _USE_SERVE_BACKEND:
         frame = await _serve_pending_clarify_for(session_id)
+        if frame:
+            return {"pending": True, "request_id": frame["request_id"], "frame": frame}
+    return {"pending": False}
+
+
+@router.get("/pending_approval")
+async def pending_approval(session_id: str):
+    """Recovery endpoint, mirrors /pending_clarify exactly but for approval cards
+    (Task 6): a reconnected/reloaded client polls this to restore an approval
+    prompt whose original delivery never reached the browser."""
+    if not _valid_session_id(session_id):
+        raise HTTPException(status_code=400, detail="invalid session_id")
+    if _USE_SERVE_BACKEND:
+        frame = await _serve_pending_approval_for(session_id)
         if frame:
             return {"pending": True, "request_id": frame["request_id"], "frame": frame}
     return {"pending": False}
@@ -1195,6 +1276,30 @@ async def clarify_answer(req: ClarifyAnswerRequest):
         # under "qanswer". Store there so the answer is not lost.
         pending["answers"]["qanswer"] = req.answer or ""
         pending["done"].set()
+    return {"ok": True, "request_id": rid}
+
+
+@router.post("/approval")
+async def approval_answer(req: ApprovalAnswerRequest):
+    """Answer an in-flight approval card (Task 6, mirrors /clarify and virgil-chat's
+    /api/approval). Only the serve-backend path exists here -- the OLD in-process
+    agent path never had approval card support to begin with (Task 3's note: it
+    auto-denied), so there is no legacy branch to preserve."""
+    rid = req.request_id
+    served = _serve_approval_pending.get(rid)
+    if served is None:
+        raise HTTPException(status_code=404, detail="no pending approval for this request id (expired?)")
+    await served["client"].respond_to_request(rid, {"choice": req.choice, "all": req.all})
+    _serve_approval_pending.pop(rid, None)
+    if req.all:
+        # "approve all" may have resolved OTHER pending approvals on this session
+        # too (tools/approval.py's resolve_gateway_approval(resolve_all=True)) --
+        # drop every entry we're tracking for this session so a stale local card
+        # doesn't linger past what the gateway already cleared.
+        sid = served.get("session_id")
+        for other_rid, other in list(_serve_approval_pending.items()):
+            if other.get("session_id") == sid:
+                _serve_approval_pending.pop(other_rid, None)
     return {"ok": True, "request_id": rid}
 
 
@@ -1304,28 +1409,51 @@ async def _stream_via_serve(ws: WebSocket, msg: dict[str, Any]) -> None:
     finished = asyncio.Event()
 
     def _replay_open_requests(resume_result: dict[str, Any]) -> None:
-        """A clarify raised BEFORE we attached (e.g. the turn is running in the
-        desktop/TUI process) never arrives as a live frame -- the gateway wrote it
-        to whichever transport owned the session then. `session.resume` returns it
-        in `open_requests` precisely so a late/reconnecting client can render it.
-        Without this, a cross-surface clarify stays invisible: the exact bug this
-        whole migration exists to fix."""
+        """A clarify/approval raised BEFORE we attached (e.g. the turn is running in
+        the desktop/TUI process) never arrives as a live frame -- the gateway wrote
+        it to whichever transport owned the session then. `session.resume` returns
+        BOTH via `open_requests` (server.py's _live_session_payload) precisely so a
+        late/reconnecting client can render either. Without this, a cross-surface
+        clarify/approval stays invisible: the exact bug this whole migration exists
+        to fix.
+
+        Deliberately NOT reading the separate `pending_approval` field: verified live
+        it carries a DIFFERENT id (the approval queue's own internal id) than
+        `open_requests[].id` (the WS server-request frame id `respond_to_request()`
+        actually needs to unblock the agent) -- using the wrong one here would look
+        like a working approval card whose answer silently never reaches the agent,
+        which times out instead. See _serve_open_requests_for's note for the full
+        finding."""
         for req in (resume_result.get("open_requests") or []):
-            if req.get("method") != "clarify":
-                continue
+            method = req.get("method")
             rid, params = str(req.get("id") or ""), (req.get("params") or {})
-            if not rid or rid in _serve_clarify_pending:
+            if not rid:
                 continue
-            frame = {"type": "clarify", "request_id": rid}
-            if params.get("questions"):
-                frame["questions"] = params["questions"]
-            else:
-                frame["question"] = params.get("question") or ""
-                frame["choices"] = params.get("choices") or []
-            _serve_clarify_pending[rid] = {
-                "session_id": stored_sid, "client": client, "params": params,
-                "answers": dict(params.get("answers") or {})}
-            _push(frame)
+            if method == "clarify":
+                if rid in _serve_clarify_pending:
+                    continue
+                frame = {"type": "clarify", "request_id": rid}
+                if params.get("questions"):
+                    frame["questions"] = params["questions"]
+                else:
+                    frame["question"] = params.get("question") or ""
+                    frame["choices"] = params.get("choices") or []
+                _serve_clarify_pending[rid] = {
+                    "session_id": stored_sid, "client": client, "params": params,
+                    "answers": dict(params.get("answers") or {})}
+                _push(frame)
+            elif method == "approval":
+                if rid in _serve_approval_pending:
+                    continue
+                _serve_approval_pending[rid] = {
+                    "session_id": stored_sid, "client": client, "params": params}
+                _push({
+                    "type": "approval", "request_id": rid,
+                    "command": params.get("command") or "",
+                    "description": params.get("description") or "",
+                    "choices": params.get("choices") or ["once", "deny"],
+                    "tool_name": params.get("tool_name") or "",
+                })
 
     def _mine(sid: str) -> bool:
         # Cross-session stream leak guard (hermes-chat-frontend skill): only this
@@ -1361,19 +1489,39 @@ async def _stream_via_serve(ws: WebSocket, msg: dict[str, Any]) -> None:
             # The gateway withdrew a pending clarify/approval (timeout, /approve all,
             # answered on another surface) -- clear the card instead of leaving it stuck.
             rid = str(payload.get("id") or "")
-            if rid:
+            if not rid:
+                return
+            if rid in _serve_approval_pending:
+                _serve_approval_pending.pop(rid, None)
+                _push({"type": "approval.expire", "request_id": rid})
+            else:
                 _push({"type": "clarify.expire", "request_id": rid})
 
     def _on_request(request_id: str, method: str, sid: str, params: dict[str, Any]) -> None:
         if not _mine(sid):
             return
+        if method == "approval":
+            # A dangerous-command/execute_code gate is blocking the agent. Forward
+            # to the browser as an approval card instead of auto-denying -- Task 6:
+            # the frontend now has a real ApprovalCard, so a genuine decision can
+            # be requested instead of the turn always losing the action.
+            frame = {
+                "type": "approval", "request_id": request_id,
+                "command": params.get("command") or "",
+                "description": params.get("description") or "",
+                "choices": params.get("choices") or ["once", "deny"],
+                "tool_name": params.get("tool_name") or "",
+            }
+            _serve_approval_pending[request_id] = {
+                "session_id": stored_sid, "client": client, "params": params}
+            _push(frame)
+            return
         if method != "clarify":
-            # approval/sudo/etc: Task 6. Answering nothing would hang the agent, so
-            # decline explicitly rather than silently blocking (the exact failure
-            # mode this migration exists to eliminate).
+            # sudo/secret/vault/etc: still no UI for these. Answering nothing would
+            # hang the agent, so decline explicitly rather than silently blocking
+            # (the exact failure mode this migration exists to eliminate).
             asyncio.run_coroutine_threadsafe(
-                client.respond_to_request(request_id, {"choice": "deny"} if method == "approval" else {"value": ""}),
-                loop)
+                client.respond_to_request(request_id, {"value": ""}), loop)
             return
         # The gateway ALWAYS sends the batch shape (questions[] with qid), even for
         # a single question -- verified live. Forward it verbatim: the frontend's

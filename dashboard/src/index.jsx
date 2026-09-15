@@ -411,6 +411,32 @@ function ClarifyCard({ frame, onAnswer }) {
         answered ? React.createElement("div", { className: "q-answer" }, "Answered: ", React.createElement("strong", null, answers[qid])) : null);
     }));
 }
+// Approval card (Task 6): a dangerous-command/execute_code gate is blocking the
+// agent until this session answers. Distinct from ClarifyCard: fixed choices
+// (once/session/always/deny -- server-provided in frame.choices), not free
+// text, and the card shows the actual command so you can see what you're
+// approving before you tap. Mirrors virgil-chat's showApproval/answerApproval
+// (~/src/paduq/virgil/index.html), ported to this file's React/element style.
+var APPROVAL_LABELS = { once: "Approve once", session: "Approve for this session", always: "Always approve", deny: "Deny" };
+function ApprovalCard({ frame, onAnswer }) {
+  var [done, setDone] = useState(false);
+  var [chosen, setChosen] = useState(null);
+  function choose(choice) {
+    if (done) return;
+    setDone(true); setChosen(choice);
+    onAnswer(frame.request_id, choice);
+  }
+  var choices = (frame.choices && frame.choices.length) ? frame.choices : ["once", "deny"];
+  return React.createElement("div", { className: "wc-clarify" + (done ? " answered" : "") },
+    React.createElement("div", { className: "q-title" }, "The agent needs approval to run something"),
+    frame.description ? React.createElement("div", { className: "q-text" }, frame.description) : null,
+    frame.command ? React.createElement("pre", { style: { maxHeight: 220, overflow: "auto", fontSize: 12 } },
+      React.createElement("code", null, frame.command)) : null,
+    React.createElement("div", { className: "q-choices" },
+      choices.map((c, i) => React.createElement("button", { key: i, className: "q-choice", disabled: done, onClick: () => choose(c) },
+        APPROVAL_LABELS[c] || c))),
+    done ? React.createElement("div", { className: "q-answer" }, "You chose: ", React.createElement("strong", null, APPROVAL_LABELS[chosen] || chosen)) : null);
+}
 function EmptyState({ onSuggestion }) {
   var suggestions = [
     { label: "Analyze a workspace", prompt: "Analyze this workspace structure and give me 3 engineering risks. Use tools and keep it concise." },
@@ -456,8 +482,12 @@ function ChatPage() {
   var [busyMap, setBusyMap] = useState({});
   var [statusMap, setStatusMap] = useState({});
   var [clarifyMap, setClarifyMap] = useState({});
+  // Approval cards (Task 6): a dangerous-command/execute_code gate blocking the
+  // agent, distinct from clarify (fixed once/session/always/deny choices, not
+  // free text). Same per-session map shape as clarifyMap.
+  var [approvalMap, setApprovalMap] = useState({});
   // Session ids (any chat, not just the one currently open) with an
-  // unanswered clarify card -- powers the sidebar badge. Polled
+  // unanswered clarify OR approval card -- powers the sidebar badge. Polled
   // unconditionally (even while document.hidden) so a question raised in
   // a background chat, or while the tab/phone is backgrounded, is still
   // visible the next time the user glances at the sidebar.
@@ -465,9 +495,11 @@ function ChatPage() {
   var busy = !!busyMap[sessionId];
   var status = statusMap[sessionId] || null;
   var clarify = clarifyMap[sessionId] || null;
+  var approval = approvalMap[sessionId] || null;
   function setBusyFor(sid, val) { setBusyMap(m => { var n = Object.assign({}, m); if (val) n[sid] = true; else delete n[sid]; return n; }); }
   function setStatusFor(sid, val) { setStatusMap(m => { var n = Object.assign({}, m); if (val) n[sid] = val; else delete n[sid]; return n; }); }
   function setClarifyFor(sid, val) { setClarifyMap(m => { var n = Object.assign({}, m); if (val) n[sid] = val; else delete n[sid]; return n; }); }
+  function setApprovalFor(sid, val) { setApprovalMap(m => { var n = Object.assign({}, m); if (val) n[sid] = val; else delete n[sid]; return n; }); }
   // Migrate a per-session map entry from oldKey to newKey, used when the
   // backend renames a brand-new client-minted session id to its canonical
   // server id (see the "session" frame handler in send()) -- without this,
@@ -572,6 +604,13 @@ function ChatPage() {
       if (d && d.pending && d.frame) setClarifyFor(id, d.frame);
     }).catch(() => { });
   }
+  // Approval recovery mirror of checkPendingClarify -- same fix class, different
+  // request type (Task 6).
+  function checkPendingApproval(id) {
+    afetch(withProfile(api("/pending_approval?session_id=" + encodeURIComponent(id)))).then(r => r.ok ? r.json() : null).then(d => {
+      if (d && d.pending && d.frame) setApprovalFor(id, d.frame);
+    }).catch(() => { });
+  }
   function loadSession(id) {
     setError(null); setEditingIdx(null); setEditText("");
     var perfDone = PerfTracker.startSessionSwitch();
@@ -582,6 +621,7 @@ function ChatPage() {
       setMessages(d.messages || d.history || []); setAttachments([]);
       perfDone();
       checkPendingClarify(id);
+      checkPendingApproval(id);
       // Server-side truth for "is this session's turn actually in flight" --
       // this tab's own busyMap always starts empty on load/refresh, so
       // without this a still-running turn (started here before a reload, or
@@ -728,6 +768,7 @@ function ChatPage() {
       // unconditionally. Still gated on !clarify so we don't clobber a card
       // already showing / mid-answer.
       if (!clarify) checkPendingClarify(sessionId);
+      if (!approval) checkPendingApproval(sessionId);
     }
     function onVis() { if (!document.hidden) sync(); }
     function onFocus() { sync(); }
@@ -739,6 +780,7 @@ function ChatPage() {
       loadSessions();
       if (!busy) refreshMessages(sessionId);
       if (!clarify) checkPendingClarify(sessionId);
+      if (!approval) checkPendingApproval(sessionId);
     }, 5000);
     return () => {
       document.removeEventListener("visibilitychange", onVis);
@@ -828,6 +870,17 @@ function ChatPage() {
       if (!busy) setStatusFor(sessionId, "thinking");
     }
   }
+  // Mirrors answerClarify exactly (Task 6): fixed-choice POST, then clear this
+  // tab's own state immediately rather than waiting for a server push that can
+  // be lost the same way a clarify answer's can (dead/backgrounded WS, or a
+  // session recovered via the REST-only watchRemoteBusy poll with no live
+  // socket at all).
+  function answerApproval(requestId, choice) {
+    afetch(api("/approval"), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ request_id: requestId, choice: choice }) }).catch(() => { });
+    setApprovalFor(sessionId, null);
+    setPendingClarifySessions(ids => ids.filter(x => x !== sessionId));
+    if (!busy) setStatusFor(sessionId, "thinking");
+  }
   var startEdit = useCallback(function (idx) {
     if (busy) return;
     var m = messagesRef.current[idx];
@@ -885,7 +938,7 @@ function ChatPage() {
     if (sid === sessionIdRef.current) { pendingScrollRef.current = true; setMessages(next); }
     saveLocal(sid, next);
     if (sid === sessionIdRef.current) { setInput(""); setAttachments([]); }
-    setBusyFor(sid, true); setStatusFor(sid, "thinking"); setError(null); setClarifyFor(sid, null);
+    setBusyFor(sid, true); setStatusFor(sid, "thinking"); setError(null); setClarifyFor(sid, null); setApprovalFor(sid, null);
     streamingMapRef.current[sid] = "";
     var chunks = [];
     var ws = new WebSocket(wsUrl("/stream"));
@@ -905,6 +958,7 @@ function ChatPage() {
           renameKey(setBusyMap, oldSid, streamSid, true);
           renameKey(setStatusMap, oldSid, streamSid, "thinking");
           renameKey(setClarifyMap, oldSid, streamSid, null);
+          renameKey(setApprovalMap, oldSid, streamSid, null);
           wsMapRef.current[streamSid] = wsMapRef.current[oldSid]; delete wsMapRef.current[oldSid];
           streamingMapRef.current[streamSid] = streamingMapRef.current[oldSid] || ""; delete streamingMapRef.current[oldSid];
         }
@@ -921,11 +975,13 @@ function ChatPage() {
       }
       else if (f.type === "clarify") { setClarifyFor(streamSid, f); setStatusFor(streamSid, null); }
       else if (f.type === "clarify.expire") { setClarifyFor(streamSid, null); setStatusFor(streamSid, "thinking"); }
+      else if (f.type === "approval") { setApprovalFor(streamSid, f); setStatusFor(streamSid, null); }
+      else if (f.type === "approval.expire") { setApprovalFor(streamSid, null); setStatusFor(streamSid, "thinking"); }
       else if (f.type === "done") {
         var final = f.text || chunks.join("");
         var doneMsgs = next.concat([{ role: "assistant", text: final, timestamp: Date.now() / 1000, attachments: [] }]);
         if (sessionIdRef.current === streamSid) setMessages(doneMsgs);
-        saveLocal(f.session_id || streamSid, doneMsgs); setStatusFor(streamSid, null); setClarifyFor(streamSid, null); loadSessions();
+        saveLocal(f.session_id || streamSid, doneMsgs); setStatusFor(streamSid, null); setClarifyFor(streamSid, null); setApprovalFor(streamSid, null); loadSessions();
       }
       else if (f.type === "clear") setStatusFor(streamSid, null);
       else if (f.type === "error") { if (sessionIdRef.current === streamSid) setError(f.text || "Agent error"); setStatusFor(streamSid, null); }
@@ -1015,6 +1071,7 @@ function ChatPage() {
         })
           : React.createElement(EmptyState, { onSuggestion: (p) => send(p) }),
         clarify ? React.createElement(ClarifyCard, { frame: clarify, onAnswer: answerClarify }) : null,
+        approval ? React.createElement(ApprovalCard, { frame: approval, onAnswer: answerApproval }) : null,
         !atBottom ? React.createElement("button", { className: "wc-jump", onClick: jumpToBottom, title: "Jump to latest" }, "↓") : null),
       error ? React.createElement("div", { className: "wc-error" }, error) : null,
       React.createElement(StatusLine, { label: status }),
