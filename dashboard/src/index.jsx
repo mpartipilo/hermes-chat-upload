@@ -53,6 +53,7 @@ button{touch-action:manipulation;font-family:inherit}
 .wc-jump{position:sticky;bottom:8px;align-self:flex-end;width:36px;height:36px;border-radius:50%;background:var(--wc-accent-strong);color:var(--wc-accent-ink);border:none;font-size:18px;cursor:pointer;box-shadow:0 2px 8px rgb(0 0 0/.4);display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:-44px}
 .wc-row{display:flex;gap:6px;max-width:100%}
 .wc-row.wc-grouped{margin-top:-4px}
+.wc-part+.wc-part{margin-top:10px}
 .wc-row.user{justify-content:flex-end}
 .wc-row.assistant{justify-content:flex-start}
 .wc-avatar-spacer{width:24px;flex-shrink:0}
@@ -316,12 +317,31 @@ function StatusLine({ label }) {
     React.createElement("span", { className: "wc-dots" }, React.createElement("span"), React.createElement("span"), React.createElement("span")),
     React.createElement("span", null, label + "…"));
 }
+// Avatar visibility. Hidden for now (the [H] chip on every assistant row was
+// visual noise); a user-facing setting can flip this later without touching
+// the render paths below.
+var SHOW_AVATAR = false;
+
+// One assistant TURN = one bubble. The backend emits an assistant turn as
+// several messages (text, tool results, follow-on text); rendering each as its
+// own box made a single reply look like a dozen separate replies. Consecutive
+// same-role messages are merged into one box, each part separated by spacing
+// rather than a new bubble + avatar.
+var AssistantGroup = React.memo(function AssistantGroup({ items }) {
+  return React.createElement("div", { className: "wc-row assistant" },
+    SHOW_AVATAR ? React.createElement("div", { className: "wc-avatar" }, "H") : null,
+    React.createElement("div", { className: "wc-bubble" },
+      items.map(function (it) {
+        return React.createElement("div", { key: it.key, className: "wc-part" },
+          React.createElement(AgentContent, { text: it.text }));
+      })));
+});
 var Bubble = React.memo(function Bubble({ msg, idx, canEdit, editing, editValue, onEditChange, onStartEdit, onSaveEdit, onCancelEdit, grouped }) {
   var role = msg.role || "assistant";
   var text = msg.text || msg.content || "";
   if (role === "assistant") {
     return React.createElement("div", { className: "wc-row assistant" + (grouped ? " wc-grouped" : "") },
-      grouped ? React.createElement("div", { className: "wc-avatar-spacer" }) : React.createElement("div", { className: "wc-avatar" }, "H"),
+      SHOW_AVATAR ? (grouped ? React.createElement("div", { className: "wc-avatar-spacer" }) : React.createElement("div", { className: "wc-avatar" }, "H")) : null,
       React.createElement("div", { className: "wc-bubble" }, React.createElement(AgentContent, { text: text })));
   }
   if (editing) {
@@ -510,6 +530,23 @@ function ChatPage() {
   var streamingMapRef = useRef({});
   var messagesRef = useRef([]);
   useEffect(() => { messagesRef.current = messages; }, [messages]);
+  // Group consecutive same-role messages into runs so an assistant turn that
+  // arrives as several messages renders as ONE bubble instead of a stack of
+  // boxes. Memoized on `messages` -- recomputing per render would defeat the
+  // Bubble/AgentContent memoization that keeps streaming cheap.
+  var messageRuns = useMemo(function () {
+    var runs = [];
+    for (var i = 0; i < messages.length; i++) {
+      var m = messages[i];
+      var role = m.role || "assistant";
+      var key = m.id != null ? "m" + m.id : "i" + i;
+      var item = { key: key, msg: m, idx: i, text: m.text || m.content || "" };
+      var last = runs[runs.length - 1];
+      if (last && last.role === role) last.items.push(item);
+      else runs.push({ role: role, key: key, items: [item] });
+    }
+    return runs;
+  }, [messages]);
   var sessionIdRef = useRef(sessionId);
   useEffect(() => { sessionIdRef.current = sessionId; }, [sessionId]);
   // input/attachments/busyMap change on every keystroke/upload -- `send` must
@@ -959,13 +996,23 @@ function ChatPage() {
           current.title || "Chat",
           React.createElement("span", { className: "wc-sub" }, sourceLabel(current.source) || "web-chat"))),
       React.createElement("div", { className: "wc-messages", ref: scrollRef, onScroll: onScroll },
-        messages.length ? messages.map((m, i) => React.createElement(Bubble, {
-          key: m.id != null ? "m" + m.id : i, msg: m, idx: i,
-          canEdit: m.role === "user" && !busy && !m.streaming,
-          editing: editingIdx === i, editValue: editingIdx === i ? editText : "", onEditChange: setEditText,
-          onStartEdit: startEdit, onSaveEdit: saveEdit, onCancelEdit: cancelEdit,
-          grouped: i > 0 && (messages[i - 1].role || "assistant") === (m.role || "assistant"),
-        }))
+        messages.length ? messageRuns.map(function (run) {
+          // Assistant runs collapse into ONE bubble. User messages stay
+          // individual -- each needs its own edit-and-resend affordance, and
+          // consecutive user messages are rare (only when sent before a reply).
+          if (run.role === "assistant") {
+            return React.createElement(AssistantGroup, { key: run.key, items: run.items });
+          }
+          return run.items.map(function (it) {
+            return React.createElement(Bubble, {
+              key: it.key, msg: it.msg, idx: it.idx,
+              canEdit: !busy && !it.msg.streaming,
+              editing: editingIdx === it.idx, editValue: editingIdx === it.idx ? editText : "", onEditChange: setEditText,
+              onStartEdit: startEdit, onSaveEdit: saveEdit, onCancelEdit: cancelEdit,
+              grouped: false,
+            });
+          });
+        })
           : React.createElement(EmptyState, { onSuggestion: (p) => send(p) }),
         clarify ? React.createElement(ClarifyCard, { frame: clarify, onAnswer: answerClarify }) : null,
         !atBottom ? React.createElement("button", { className: "wc-jump", onClick: jumpToBottom, title: "Jump to latest" }, "↓") : null),
