@@ -85,7 +85,14 @@ button{touch-action:manipulation;font-family:inherit}
 @keyframes wc-blink{0%,80%,100%{opacity:.25}40%{opacity:1}}
 .wc-status{display:flex;align-items:center;gap:6px;padding:4px 10px;color:var(--wc-muted);font-size:12px;flex-shrink:0}
 .wc-error{margin:0 10px 6px;padding:8px 10px;background:rgba(248,113,113,.1);color:var(--wc-danger);border-radius:4px;font-size:13px;border:1px solid rgba(248,113,113,.3)}
-.wc-inputbar{display:flex;align-items:flex-end;gap:6px;padding:8px 10px;padding-bottom:calc(8px + env(safe-area-inset-bottom,0px));border-top:1px solid var(--wc-border);background:var(--wc-card);flex-shrink:0;contain:layout}
+.wc-cmdout{margin:0 10px 6px;padding:8px 10px;background:var(--wc-card2);color:var(--wc-fg);border-radius:4px;font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word;border:1px solid var(--wc-border);max-height:200px;overflow-y:auto;position:relative}
+.wc-cmdout-close{position:absolute;top:4px;right:6px;background:transparent;border:none;color:var(--wc-muted);cursor:pointer;font-size:14px;padding:2px 4px}
+.wc-slashmenu{position:absolute;left:0;right:0;bottom:100%;margin-bottom:4px;max-height:220px;overflow-y:auto;background:var(--wc-card);border:1px solid var(--wc-border);border-radius:6px;box-shadow:0 -4px 16px rgb(0 0 0/.4);z-index:40}
+.wc-slashitem{display:flex;gap:8px;align-items:baseline;padding:7px 10px;cursor:pointer;font-size:13px}
+.wc-slashitem.active,.wc-slashitem:hover{background:var(--wc-card2)}
+.wc-slashitem .name{color:var(--wc-accent);font-family:ui-monospace,monospace;font-weight:600;flex-shrink:0}
+.wc-slashitem .desc{color:var(--wc-muted);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wc-inputbar{display:flex;align-items:flex-end;gap:6px;padding:8px 10px;padding-bottom:calc(8px + env(safe-area-inset-bottom,0px));border-top:1px solid var(--wc-border);background:var(--wc-card);flex-shrink:0;contain:layout;position:relative}
 .wc-inputbar textarea{flex:1;min-height:40px;max-height:132px;resize:none;border:1px solid var(--wc-border);background:var(--wc-bg);color:var(--wc-fg);border-radius:6px;padding:9px 10px;font-size:15px;font-family:inherit;line-height:1.4;outline:none}
 .wc-inputbar textarea:focus{border-color:var(--wc-accent)}
 .wc-attach{display:flex;flex-wrap:wrap;gap:4px;padding:4px 0 0}
@@ -522,6 +529,15 @@ function ChatPage() {
   var [atBottom, setAtBottom] = useState(true);
   var [editingIdx, setEditingIdx] = useState(null);
   var [editText, setEditText] = useState("");
+  // Slash-command support: composer autocomplete (fed by the gateway's own
+  // commands.catalog -- every CLI built-in, quick command, plugin command and
+  // installed skill, so this list never needs to be hand-maintained here) plus
+  // an ephemeral output banner for command replies that are NOT a normal
+  // agent turn (e.g. /compress, /usage, /tools -- text the gateway generated
+  // locally without involving the model).
+  var [commandsCatalog, setCommandsCatalog] = useState([]);
+  var [slashHighlight, setSlashHighlight] = useState(0);
+  var [commandOutput, setCommandOutput] = useState(null);
   var scrollRef = useRef(null), fileRef = useRef(null), inputRef = useRef(null);
   // One WebSocket per session id, so a background session's stream keeps
   // running (and can be individually stopped) while another is viewed.
@@ -706,6 +722,7 @@ function ChatPage() {
         setProfile(d.current || d.active || "default");
       }).catch(() => { setProfile("default"); });
     }
+    afetch(withProfile(api("/commands"))).then(r => r.json()).then(d => setCommandsCatalog(d.commands || [])).catch(() => { });
     afetch("/api/model/options?explicit_only=1").then(r => r.json()).then(d => {
       var list = [];
       (d.providers || []).forEach(p => {
@@ -989,8 +1006,67 @@ function ChatPage() {
     ws.onerror = function () { if (sessionIdRef.current === streamSid) setError("Connection error. Restart dashboard and retry if the plugin was just updated."); setBusyFor(streamSid, false); setStatusFor(streamSid, null); };
     ws.onclose = function () { if (wsMapRef.current[streamSid] === ws) delete wsMapRef.current[streamSid]; setBusyFor(streamSid, false); setStatusFor(streamSid, null); };
   }, [profile, sessionModel, sessionEffort]);
+  var slashMenuOpen = input.length > 0 && input.charAt(0) === "/" && input.indexOf(" ") === -1 && input.indexOf("\n") === -1;
+  var slashFiltered = useMemo(function () {
+    if (!slashMenuOpen) return [];
+    var q = input.slice(1).toLowerCase();
+    return commandsCatalog.filter(function (c) { return !q || c.name.toLowerCase().indexOf(q) !== -1; }).slice(0, 8);
+  }, [slashMenuOpen, input, commandsCatalog]);
+  useEffect(() => { setSlashHighlight(0); }, [input]);
+  // Backend catalog names already include the leading "/" (commands.catalog
+  // pairs are canonical "/name" keys) -- do not double it up here.
+  function applySlashSelection(item) {
+    var name = String(item.name || "").replace(/^\/+/, "");
+    setInput("/" + name + " ");
+    if (inputRef.current) inputRef.current.focus();
+  }
+  // Runs a Hermes slash command (skills, /model, /compress, /undo, plugin
+  // commands, quick commands -- whatever the gateway's own registry knows,
+  // see plugin_api.py's /slash) instead of sending the text as a chat turn.
+  function runSlashCommand(raw) {
+    var text = raw.trim();
+    setInput(""); setCommandOutput(null); setError(null);
+    afetch(withProfile(api("/slash")), {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ command: text, session_id: sessionIdRef.current }),
+    }).then(function (r) {
+      if (!r.ok) return r.json().catch(function () { return {}; }).then(function (d) { throw new Error(d.detail || ("HTTP " + r.status)); });
+      return r.json();
+    }).then(function (d) {
+      if (d.kind === "send") {
+        if (d.notice) setCommandOutput(d.notice);
+        send(d.message);
+      } else if (d.kind === "prefill") {
+        if (d.notice) setCommandOutput(d.notice);
+        setInput(d.message || "");
+        if (inputRef.current) inputRef.current.focus();
+      } else {
+        setCommandOutput(d.text || "(no output)");
+        loadSessions();
+      }
+    }).catch(function (e) { setError("Command failed: " + (e && e.message || e)); });
+  }
+  // Single entry point for both the send button and Cmd/Ctrl+Enter: text
+  // starting with "/" is a slash command, everything else is a normal turn.
+  function submit() {
+    var text = inputRef2.current.trim();
+    if (!text && !attachmentsRef.current.length) return;
+    if (text.charAt(0) === "/") { runSlashCommand(text); return; }
+    send();
+  }
   function key(e) {
-    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(); return; }
+    if (slashMenuOpen && slashFiltered.length) {
+      if (e.key === "ArrowDown") { e.preventDefault(); setSlashHighlight(function (h) { return Math.min(h + 1, slashFiltered.length - 1); }); return; }
+      if (e.key === "ArrowUp") { e.preventDefault(); setSlashHighlight(function (h) { return Math.max(h - 1, 0); }); return; }
+      if (e.key === "Tab" || (e.key === "Enter" && !e.metaKey && !e.ctrlKey)) {
+        e.preventDefault();
+        var item = slashFiltered[Math.min(slashHighlight, slashFiltered.length - 1)];
+        if (item) applySlashSelection(item);
+        return;
+      }
+      if (e.key === "Escape") { e.preventDefault(); setInput(""); return; }
+    }
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); submit(); return; }
     // Skip pure navigation/modifier keys -- they don't trigger the
     // input-state re-render this tracker is measuring.
     if (e.key && e.key.length === 1 || e.key === "Backspace" || e.key === "Delete" || e.key === "Enter") {
@@ -1074,15 +1150,25 @@ function ChatPage() {
         approval ? React.createElement(ApprovalCard, { frame: approval, onAnswer: answerApproval }) : null,
         !atBottom ? React.createElement("button", { className: "wc-jump", onClick: jumpToBottom, title: "Jump to latest" }, "↓") : null),
       error ? React.createElement("div", { className: "wc-error" }, error) : null,
+      commandOutput ? React.createElement("div", { className: "wc-cmdout" },
+        React.createElement("button", { className: "wc-cmdout-close", onClick: () => setCommandOutput(null), title: "Dismiss" }, "\u00d7"),
+        commandOutput) : null,
       React.createElement(StatusLine, { label: status }),
       React.createElement("div", { className: "wc-inputbar" },
+        slashMenuOpen && slashFiltered.length ? React.createElement("div", { className: "wc-slashmenu" },
+          slashFiltered.map(function (c, i) {
+            return React.createElement("div", {
+              key: c.name, className: "wc-slashitem" + (i === Math.min(slashHighlight, slashFiltered.length - 1) ? " active" : ""),
+              onMouseDown: function (e) { e.preventDefault(); applySlashSelection(c); },
+            }, React.createElement("span", { className: "name" }, c.name.charAt(0) === "/" ? c.name : "/" + c.name), React.createElement("span", { className: "desc" }, c.description || ""));
+          })) : null,
         React.createElement("input", { ref: fileRef, type: "file", multiple: true, style: { display: "none" }, onChange: e => uploadFiles(e.target.files) }),
         React.createElement("button", { className: "wc-hbtn", onClick: () => fileRef.current && fileRef.current.click(), disabled: busy, title: "Attach file", style: { minWidth: 44, height: 44 } }, "📎"),
         React.createElement("div", { style: { flex: 1, display: "flex", flexDirection: "column", minWidth: 0 } },
           React.createElement("textarea", { ref: inputRef, value: input, onChange: e => setInput(e.target.value), onKeyDown: key, placeholder: busy ? "Agent is working…" : "Type a message…", disabled: busy, rows: 1, style: { width: "100%", overflowY: "auto" } }),
           attachments.length ? React.createElement("div", { className: "wc-attach" }, attachments.map((a, i) => React.createElement(FileChip, { key: i, path: a.path, onRemove: () => setAttachments(x => x.filter((_, j) => j !== i)) }))) : null),
         busy ? React.createElement("button", { className: "wc-send stop", onClick: stop, title: "Stop" }, "■")
-             : React.createElement("button", { className: "wc-send", onClick: () => send(), disabled: !input.trim() && !attachments.length, title: "Send" }, "➤"))),
+             : React.createElement("button", { className: "wc-send", onClick: () => submit(), disabled: !input.trim() && !attachments.length, title: "Send" }, "➤"))),
     React.createElement("div", { className: "wc-sheet" + (sessionsOpen ? " open" : "") },
       React.createElement("div", { className: "wc-sheet-backdrop", onClick: () => setSessionsOpen(false) }),
       React.createElement("div", { className: "wc-sheet-panel" },

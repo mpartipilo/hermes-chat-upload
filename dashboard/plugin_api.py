@@ -286,6 +286,11 @@ class RewindRequest(BaseModel):
     message_id: int
 
 
+class SlashRequest(BaseModel):
+    command: str  # leading "/" optional; may include args, e.g. "/model claude-sonnet-4"
+    session_id: str
+
+
 class ClientPerfRequest(BaseModel):
     # Frontend perf samples, aggregated client-side before sending (never one
     # beacon per event -- see PERF_PROFILER.md). event is one of "keystroke"
@@ -606,6 +611,124 @@ async def sessions_rewind(session_id: str, req: RewindRequest, profile: Optional
         raise HTTPException(status_code=400, detail="invalid session_id")
     _pending_truncate[session_id] = int(req.message_id)
     return {"ok": True, "session_id": session_id, "rewound_count": 0, "deferred": True}
+
+
+# Slash-command catalog is expensive (walks the skill registry) and the composer
+# can request it on every `/` keystroke while the user is typing a command --
+# cache briefly per profile rather than hitting commands.catalog every time.
+_commands_catalog_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_COMMANDS_CATALOG_TTL = 60.0
+
+
+@router.get("/commands")
+async def commands_catalog(profile: Optional[str] = Query(None)):
+    """Slash-command list for the composer's `/` autocomplete.
+
+    Proxies `commands.catalog` on the same `hermes serve` daemon the turn itself
+    runs on -- CLI built-ins, quick commands, plugin commands, and every
+    installed skill (skills become slash commands automatically; this is the
+    exact registry the TUI's own `/` menu reads), so web-chat never needs its
+    own hardcoded command list and stays in sync with whatever the profile has
+    installed.
+    """
+    key = profile or "default"
+    now = time.time()
+    cached = _commands_catalog_cache.get(key)
+    if cached and (now - cached[0]) < _COMMANDS_CATALOG_TTL:
+        return cached[1]
+    try:
+        result = await _serve_client(profile).rpc("commands.catalog", {})
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"commands.catalog failed: {exc}")
+    pairs = result.get("pairs") or []
+    items = [{"name": p[0], "description": p[1]} for p in pairs if isinstance(p, (list, tuple)) and len(p) >= 2]
+    items.sort(key=lambda x: x["name"])
+    payload = {"commands": items, "warning": result.get("warning") or ""}
+    _commands_catalog_cache[key] = (now, payload)
+    return payload
+
+
+async def _dispatch_slash_command(
+        client, command: str, session_id: str, arg_tail: str = "", _depth: int = 0) -> dict[str, Any]:
+    """Run one slash command through the gateway's real `slash.exec` ->
+    `command.dispatch` chain and normalize the result into a shape the
+    browser can act on, mirroring ui-tui's createSlashHandler.ts (the same
+    dispatch-type contract, just consumed here instead of by the Ink TUI):
+
+    - exec/plugin  -> plain text output (compress, usage, history, /tools, ...)
+    - alias        -> re-dispatch under the canonical name (bounded recursion)
+    - skill/send   -> a MESSAGE that must be run as a normal agent turn
+                      (skills, quick-command `send` type) -- caller submits it
+                      through the existing /stream path, not this endpoint
+    - prefill      -> text to drop into the composer for the user to edit (/undo)
+
+    slash.exec 404s for skill/bundle commands on purpose (it deliberately routes
+    those to command.dispatch, per methods_tools.py's own stage order) -- catch
+    and retry there exactly like the TUI's `.catch()` fallback does.
+    """
+    if _depth > 5:
+        raise RuntimeError("slash command alias loop")
+    body = command.lstrip("/").strip()
+    parts = body.split(maxsplit=1)
+    name = parts[0] if parts else ""
+    arg = parts[1] if len(parts) > 1 else ""
+    try:
+        result = await client.rpc("slash.exec", {"command": body, "session_id": session_id})
+    except RuntimeError:
+        result = await client.rpc("command.dispatch", {"name": name, "arg": arg, "session_id": session_id})
+    rtype = result.get("type")
+    if rtype in ("exec", "plugin"):
+        return {"kind": "output", "text": result.get("output") or "(no output)"}
+    if rtype == "alias" and result.get("target"):
+        next_cmd = str(result["target"]).lstrip("/") + (f" {arg}" if arg else "")
+        return await _dispatch_slash_command(client, next_cmd, session_id, arg, _depth + 1)
+    if rtype in ("skill", "send"):
+        message = str(result.get("message") or "").strip()
+        if not message:
+            return {"kind": "output", "text": f"/{name}: empty message"}
+        return {"kind": "send", "message": message,
+                "notice": result.get("notice") or "", "display": result.get("display") or ""}
+    if rtype == "prefill":
+        return {"kind": "prefill", "message": result.get("message") or "", "notice": result.get("notice") or ""}
+    # Plain slash.exec success: no `type` tag, just {output, warning?}.
+    body_out = result.get("output") or f"/{name}: no output"
+    text = f"warning: {result['warning']}\n{body_out}" if result.get("warning") else body_out
+    return {"kind": "output", "text": text}
+
+
+@router.post("/slash")
+async def slash_exec(req: SlashRequest, profile: Optional[str] = Query(None)):
+    """Run a Hermes slash command (skills, /model, /compress, /title, quick
+    commands, /undo, plugin commands, ...) through the SAME command.dispatch
+    machinery the desktop app and TUI use, instead of web-chat reimplementing
+    a subset locally -- every profile-specific/plugin/skill command Just Works
+    without this file knowing its name.
+    """
+    if not _valid_session_id(req.session_id):
+        raise HTTPException(status_code=400, detail="invalid session_id")
+    command = req.command.strip()
+    if not command:
+        raise HTTPException(status_code=400, detail="empty command")
+    client = _serve_client(profile)
+    # slash.exec/command.dispatch resolve session_id against the gateway's LIVE
+    # _sessions map, not the store (same requirement config.set/model has -- see
+    # _set_model_via_serve) -- resume to register it, or create if this is a
+    # brand-new client-minted id the gateway has never seen.
+    try:
+        resumed = await client.rpc("session.resume", {"session_id": req.session_id, "omit_messages": True})
+        runtime_sid = str(resumed.get("session_id") or req.session_id)
+    except Exception:
+        created = await client.rpc("session.create", {"title": "New chat", "source": _WEBCHAT_SOURCE})
+        runtime_sid = str(created.get("session_id") or "")
+    if not runtime_sid:
+        raise HTTPException(status_code=500, detail="could not resolve session")
+    try:
+        return await _dispatch_slash_command(client, command, runtime_sid)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        log.exception("web-chat: slash command failed")
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @router.post("/perf/client")
