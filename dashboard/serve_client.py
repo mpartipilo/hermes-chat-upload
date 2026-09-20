@@ -20,6 +20,7 @@ import asyncio
 import itertools
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -116,6 +117,32 @@ class HermesServeClient:
             self._ws = await websockets.connect(
                 url, ping_interval=20, ping_timeout=20, max_size=None)
             self._recv_task = asyncio.create_task(self._recv_loop())
+            # Declare that we answer server->client requests. WITHOUT this the
+            # gateway fails every such request FAST instead of delivering it:
+            # tui_gateway/server_requests.py's _unanswerable() only delivers to
+            # transports that sent client.capabilities {server_requests: true}
+            # (registered by methods_voice.py's "client.capabilities" handler via
+            # advertise()). A client that never sends it gets clarify, approval,
+            # sudo, secret AND vault prompts silently dropped -- the agent sees an
+            # empty answer and carries on, and the log says "the attached client
+            # predates server->client requests (update the Hermes app)".
+            #
+            # Keyed on the TRANSPORT (per-socket set, cleared by forget() on
+            # disconnect), so it MUST be re-sent on every reconnect -- hence here
+            # in ensure_connected(), not once at startup.
+            #
+            # Fire-and-forget: sent directly rather than via rpc(), which would
+            # recurse into ensure_connected() while we still hold its lock.
+            try:
+                await self._ws.send(json.dumps({
+                    "jsonrpc": "2.0", "id": f"cap-{int(time.time() * 1000)}",
+                    "method": "client.capabilities",
+                    "params": {"server_requests": True},
+                }))
+            except Exception:
+                log.warning("web-chat: client.capabilities failed (profile=%s) -- clarify/approval "
+                            "will be dropped by the gateway until reconnect", self.profile,
+                            exc_info=True)
             log.info("web-chat: connected to hermes serve profile=%s port=%s", self.profile, self.port)
 
     async def _recv_loop(self) -> None:
